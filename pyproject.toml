@@ -1,0 +1,67 @@
+[tool.poetry]
+name = "queue-simulator"
+version = "0.1.0"
+description = "An API to run the check-in queue simulator"
+authors = ["Lorenzo Zanchi <lorenzo.zanchi@unibg.it>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+pandas = "^2.2.3"
+numpy = "^1.26.4"
+datetime = "^5.5"
+scipy = "^1.14.1"
+openpyxl = "^3.1.5"
+requests = "^2.32.3"
+uvicorn = "^0.30.6"
+fastapi = "^0.115.0"
+python-multipart = "^0.0.12"
+simpy = "^4.1.1"
+# Importato direttamente da app/services/samplers.py e da scripts/: era una
+# dipendenza indiretta di scikit-learn, che ora non e' piu' nel gruppo main.
+joblib = "^1.4.2"
+cachetools = "^7.1.3"
+sqlalchemy = "^2.0.36"
+psycopg = {version = "^3.2.3", extras = ["binary"]}
+pydantic-settings = "^2.6.1"
+alembic = "^1.18.5"
+bcrypt = "^5.0.0"
+pyjwt = "^2.13.0"
+
+# Gruppo del solo compute service (app/compute_service): il backend non
+# importa piu' arrival_flow.py, quindi la sua immagine puo' fare
+# `poetry install --only main` e restare senza torch.
+[tool.poetry.group.compute.dependencies]
+torch = {version = "^2.14.0", source = "pytorch-cpu"}
+zuko = "^1.6.0"
+# xgboost serve al compute service per deserializzare pax_model.joblib
+# (joblib.load rimonta l'oggetto xgboost); scikit-learn solo al codice di
+# training in app/services/predictive.py, che gira dai notebook. Nessuno dei
+# due e' importato dal backend, e xgboost su Linux si porta dietro
+# nvidia-nccl-cu12 (~200 MB).
+scikit-learn = "^1.5.2"
+# xgboost-cpu = stesso pacchetto senza i kernel CUDA (stesso import
+# `xgboost`, stessa versione): su Linux quello normale porta con se'
+# nvidia-nccl-cu12 e una libxgboost con dentro la GPU, circa 600 MB di
+# immagine per un modello che gira su CPU.
+xgboost-cpu = "3.1.3"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+# Usata solo da app/services/plotting_utils.py, che serve ai notebook: non
+# la importa nessuna rotta ne' nessuno script schedulato.
+matplotlib = "^3.9.2"
+
+# Su Linux il torch di PyPI si tira dietro tutto lo stack CUDA 13 (cuda-toolkit,
+# cudnn, nccl, triton): qualche GB di immagine per un modello che gira su CPU
+# (load_arrival_flow usa map_location="cpu"). Questo indice serve le stesse
+# versioni compilate senza CUDA. priority = "explicit" = usato solo dai
+# pacchetti che lo chiedono per nome, tutto il resto continua da PyPI.
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
