@@ -3,6 +3,7 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 import numpy as np
+import pandas as pd
 
 # Tolerance used (a) to validate that demand lies in [0, 1] and (b) to ignore
 # float rounding noise when deciding whether a marginal gain is worth taking.
@@ -309,13 +310,81 @@ def solve_allocated(
     return [solve_coverage(row, L, alpha, max_rects=int(k), allow_overhang=allow_overhang)
             for row, k in zip(D, alloc.k)]
 
+@dataclass
+class CoverageReport:
+    blocks: pd.DataFrame
+    rows: pd.DataFrame
+    total: pd.Series
+
+def coverage_report(D, sols, L, time_values=None, row_labels=None) -> CoverageReport:
+    """
+    D    : (n_rows, T) demand grid in [0, 1]
+    sols : list of Solution for the first len(sols) rows (the rows that have a server); the remaining
+           rows of D have no server: they count as demand with 0 blocks, 0 coverage
+    row_labels : optional names for the index of `rows` (e.g. server labels, "no server" beyond)
+    L    : shift length in bins
+    All quantities are in counter-bins (area of D). coverage = covered demand / demand area.
+    """
+    D = np.asarray(D, dtype=np.float64)
+    if len(sols) > D.shape[0]:
+        raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
+    row_demand = D.sum(axis=1)
+    total_demand = float(D.sum())
+    safe = lambda num, den: num / den if den > 0 else np.nan
+ 
+    if time_values is not None:
+        tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
+        step = tv.iloc[1] - tv.iloc[0]
+ 
+    recs = []
+    for c, sol in enumerate(sols):
+        for b, s0 in enumerate(sol.starts):
+            s0 = int(s0)
+            covered = float(D[c, s0:s0 + L].sum())
+            rec = dict(row=c, block=b, start_slot=s0, end_slot=s0 + L)
+            if time_values is not None:
+                rec.update(start_time=tv.iloc[s0], end_time=tv.iloc[s0] + L * step)
+            rec.update(
+                covered_demand=covered,
+                idle_capacity=L - covered,
+                utilization=covered / L,
+            )
+            recs.append(rec)
+    blocks = pd.DataFrame(recs)
+    if blocks.empty:
+        blocks = pd.DataFrame(columns=["row", "block", "start_slot", "end_slot", "covered_demand",
+                                       "idle_capacity", "utilization"])
+ 
+    n_rows = D.shape[0]
+    covered_by_row = blocks.groupby("row")["covered_demand"].sum().reindex(range(n_rows), fill_value=0.0)
+    n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0)
+    capacity = n_blocks.to_numpy() * L
+    rows = pd.DataFrame({
+        "n_blocks": n_blocks.to_numpy(),
+        "demand": row_demand,
+        "covered_demand": covered_by_row.to_numpy(),
+        "missed_demand": np.clip(row_demand - covered_by_row.to_numpy(), 0.0, None),
+        "idle_capacity": capacity - covered_by_row.to_numpy(),
+        "coverage": [safe(cv, dm) for cv, dm in zip(covered_by_row, row_demand)],
+        "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
+    }).rename_axis("row")
+    rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
+ 
+    covered_tot = float(covered_by_row.sum())
+    cap_tot = float(capacity.sum())
+    total = pd.Series({
+        "n_blocks": int(n_blocks.sum()),
+        "demand": total_demand,
+        "covered_demand": covered_tot,
+        "missed_demand": max(total_demand - covered_tot, 0.0),
+        "idle_capacity": cap_tot - covered_tot,
+        "coverage": safe(covered_tot, total_demand),
+    })
+    return CoverageReport(blocks=blocks, rows=rows, total=total)
 
 
 
-
-
-
-#-------------------------
+#-------------------------non implementato
 # --------------------------------------------------------------------------- #
 # multi-length generalization: rectangles of several allowed sizes at once
 # --------------------------------------------------------------------------- #

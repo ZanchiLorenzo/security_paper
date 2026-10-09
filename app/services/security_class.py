@@ -2,442 +2,295 @@ from app.services.entities import  Interval, Flight, Passenger
 from app.services.optimizer import LanesOptimizer
 from app.services.simulation import QueueSimulationSinglequeue
 from app.services.samplers import ArrivalScenario, ArrivalGenerator
-from app.services.utils import get_processing_rate_by_label, sort_labels_by_priority, validate_intervals
+from app.services.utils import validate_intervals
+from app.services.coverage_dp import CoverageReport, coverage_report, solve_coverage_batch, allocate_budget, solve_allocated
 import app.services.metrics as metrics
 import concurrent.futures
 import datetime as dt
+import re
+import math
 import pandas as pd
 import numpy as np
 import dataclasses
 import logging
 logger = logging.getLogger(__name__)
 
-def _aggregate_arrivals(arrival_scenarios_dict, mean_processing_rate, freq="15min"):
+# server registry helpers
+def _label_of(key: str, params: dict) -> str:
+    return str(params.get("label", key))
 
-    base_scenario = next(
-        (scenario for scenario in arrival_scenarios_dict.values()
-        if scenario.scenario_id == 1), 
-        None,
-        )
+def _mean_processing_time(params: dict, label: str) -> float:
+    """Mean processing time of one passenger, in minutes."""
+    dist = params["dist"]
+    shift = params.get("shift", 0.0)
+    if dist == "gamma":
+        t = shift + params["shape"] * params["scale"]
+    elif dist == "gaussian":
+        t = shift + params["mean"]
+    elif dist == "exponential":
+        t = shift + params["scale"]
+    else:
+        raise ValueError(f"Unsupported processing distribution for server {label}: {dist}")
+    if t <= 0:
+        raise ValueError(f"Mean processing time for server {label} must be positive.")
+    return float(t)
 
-    if base_scenario is None:
-        raise ValueError("Base arrival scenario 1 was not found.")
+def mean_processing_rate(server_registry: dict[str, dict]) -> float:
+    """Mean over the servers of their processing rate, in pax per hour."""
+    if not server_registry:
+        raise ValueError("server_registry is empty.")
+    rates = [60.0 / _mean_processing_time(p, _label_of(k, p)) for k, p in server_registry.items()]
+    return float(np.mean(rates))
 
-    if not base_scenario.passengers:
-        raise ValueError("Base arrival scenario contains no passengers.")
+def get_processing_rate_by_label(server_registry: dict[str, dict], bin_minutes: float = 15.0) -> dict[str, float]:
+    """Processing rate of each server, in pax per bin of bin_minutes, keyed by label."""
+    if not server_registry:
+        raise ValueError("server_registry is empty.")
+    return {
+        _label_of(k, p): bin_minutes / _mean_processing_time(p, _label_of(k, p))
+        for k, p in server_registry.items()
+    }
 
-    arrival_times = [p.arrival_dt for p in base_scenario.passengers]
+def label_sort_key(label):
+    label = str(label).strip().upper()
+    m = re.fullmatch(r"(\d+)([A-Z]*)", label)
+    if m:
+        return (0, int(m.group(1)), m.group(2))
+    return (1, label)
 
-    first_arrival = pd.Timestamp(min(arrival_times))
-
-    start = min(
-        first_arrival.floor(freq),
-        first_arrival.normalize(),
+def sort_labels_by_priority(server_registry: dict[str, dict]) -> list[str]:
+    """Server labels ordered by priority (then by label); the first label is opened first."""
+    items = sorted(
+        server_registry.items(),
+        key=lambda kv: (int(kv[1].get("priority", 10**9)), label_sort_key(_label_of(*kv))),
     )
+    labels = [_label_of(k, p) for k, p in items]
+    if len(set(labels)) != len(labels):
+        raise ValueError("server labels in the registry must be unique.")
+    return labels
 
-    end = pd.Timestamp(max(arrival_times)).ceil(freq) + pd.Timedelta(freq)
+# sampling arrivals
 
-    time_axis = pd.date_range(
-        start=start,
-        end=end,
-        freq=freq,
-        inclusive="left",
-    )
+def _bin_index(start, end, freq: str) -> pd.DatetimeIndex:
+    start = pd.Timestamp(start).floor(freq)
+    end = pd.Timestamp(end).ceil(freq)
+    return pd.date_range(start, end, freq=freq, inclusive="left")
+ 
+def passengers_to_arrivals(passengers, freq: str = "15min") -> pd.Series:
+    """
+    passengers : list of Passenger (needs .arrival_dt)
+    freq       : frequency of the output bins
+    """
+    if not passengers:
+        raise ValueError("no passengers")
+    t = pd.DatetimeIndex([p.arrival_dt for p in passengers])
+    start = t.min()
+    end = t.max() + pd.Timedelta(freq)
+    idx = _bin_index(start, end, freq)
+    pos = idx.searchsorted(t, side="right") - 1          # bin containing each arrival
+    ok = (pos >= 0) & (t < idx[-1] + pd.Timedelta(freq))
+    if not ok.all():
+        import logging
+        logging.getLogger(__name__).warning("%d passengers outside [%s, %s) dropped", (~ok).sum(), idx[0], idx[-1] + pd.Timedelta(freq))
+    counts = np.bincount(pos[ok], minlength=len(idx)).astype(float)
+    return pd.Series(counts, index=idx, name="arrivals")
+ 
+def sampled_arrivals(flight_demand, seed: int, freq: str = "15min") -> pd.Series:
+    """
+    flight_demand : list of Flight (needs .arrival_sampler)
+    seed          : random seed for the sampling
+    freq          : frequency of the output bins
+    """
+    from app.services.samplers import ArrivalGenerator
+    pax = ArrivalGenerator().generate(flight_demand, seed)
+    return passengers_to_arrivals(pax, freq)
+ 
+def expected_arrivals(flight_demand, freq: str = "15min") -> pd.Series:
+    """
+    E[pax in bin] = sum_flights n_pax * (G(right) - G(left)), with G(t) = P(arrival <= t)
+    = 1 - CDF(minutes before departure of t). The total is exactly the number of passengers, but fractional per bin.
+    """
+    if not flight_demand:
+        raise ValueError("no flights")
+    for f in flight_demand:
+        if f.arrival_sampler is None:
+            raise ValueError(f"Flight {f.flight_key} has no arrival_sampler attached.")
+        
+    first = min(f.departure_dt - dt.timedelta(minutes=float(f.arrival_sampler.x[-1])) for f in flight_demand)
+    last = max(f.departure_dt - dt.timedelta(minutes=float(f.arrival_sampler.x[0])) for f in flight_demand)
+    idx = _bin_index(first, (last + pd.Timedelta(freq)), freq)
+    edges = idx.append(pd.DatetimeIndex([idx[-1] + pd.Timedelta(freq)]))
+    out = np.zeros(len(idx))
+    for f in flight_demand:
+        n = sum(v for v in f.pax_segments.values() if v > 0)
+        if n == 0:
+            continue
+        mins_before = (pd.Timestamp(f.departure_dt) - edges) / pd.Timedelta(minutes=1)
+        G = 1.0 - np.interp(np.asarray(mins_before, dtype=float), f.arrival_sampler.x, f.arrival_sampler.cdf)
+        out += n * np.diff(G)
+    return pd.Series(out, index=idx, name="arrivals")
+ 
+# arrivals -> demand grid
+def arrivals_to_demand_grid(arrivals, mean_processing_rate: float, bin_minutes: float = 15.0):
+    """
+    arrivals             : (T,) pax arriving in each bin
+    mean_processing_rate : pax per HOUR processed by one counter
+    returns D
+        D              : (n_counters, T) float in [0, 1]
+    """
+    a = np.asarray(arrivals, dtype=np.float64)
+    if a.ndim != 1:
+        raise ValueError("arrivals must be 1-D (T,)")
+    if mean_processing_rate <= 0 or bin_minutes <= 0:
+        raise ValueError("mean_processing_rate and bin_minutes must be > 0")
+    pax_per_counter_bin = mean_processing_rate * (bin_minutes / 60.0)
+    required_exact = a / pax_per_counter_bin
+    n_counters = int(np.ceil(required_exact.max())) if a.size else 0
+    if n_counters == 0:
+        raise ValueError("no arrivals: the demand grid would be empty")
+    D = np.clip(required_exact[None, :] - np.arange(n_counters)[:, None], 0.0, 1.0)
+    return D
 
-    out = (
-        pd.DataFrame({"arrival_dt": arrival_times})
-        .set_index("arrival_dt")
-        .resample(freq)
-        .size()
-        .reindex(time_axis, fill_value=0)
-        .rename("arrivals")
-        .rename_axis("time")
-        .reset_index()
-    )
-
-    bin_hours = pd.Timedelta(freq).total_seconds() / 3600
-    pax_per_counter_bin = mean_processing_rate * bin_hours # mean_processing_rate in pax per hour
-
-    out["required_counters_exact"] = out["arrivals"] / pax_per_counter_bin
-    out["required_counters"] = np.ceil(out["required_counters_exact"]).astype(int)
-
-    demand = out["required_counters"].to_numpy()
-
-    grid = (np.arange(demand.max())[:, None] < demand[None, :]).astype(np.uint8)
-
-    return grid, out
-
-@dataclasses.dataclass
+# results
+@dataclasses.dataclass(frozen=True, eq=False)
 class LanePlannerResults:
-    L: float
-    scale: float
-    alpha: float
-    grid: np.ndarray
-    df_alloc: pd.DataFrame
-    df_requirements: pd.DataFrame
-    server_schedule: dict[str, list[tuple]]
-    df_arrivals: pd.DataFrame
+    # ---- parameters of the run ----
+    L: float                                   # requested shift length, hours
+    L_cells: int                               # shift length actually used, in bins
+    alpha: float                               # penalty per unit of idle capacity
+    K_total: int                               # shared budget of shifts
+    bin_minutes: float                         # bin length, minutes
+    # ---- inputs / outputs ----
+    demand_grid: np.ndarray                    # (n_counters, T) demand in [0, 1], one row per counter
+    server_labels: tuple[str]                  # ordered by priority (first opened first)
+    server_schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]]   # label -> [(start, end), ...]
+    df_curves: pd.DataFrame                    # one row per bin (see SecurityLanePlanner.run)
 
 class SecurityLanePlanner:
-    def __init__(
-        self,
-        flight_demand: list[Flight],
-        server_registry: dict[str, dict],
-        ):
-        
-        if not isinstance(flight_demand, list) or not flight_demand:
-            raise ValueError("Flight demand must be a non-empty list.")
-        
-        missing_sampler = [f.flight_key for f in flight_demand if f.arrival_sampler is None]
-        if missing_sampler:
-            raise ValueError(f"Flights missing arrival_sampler: {missing_sampler[:5]}")
-        
-        if not isinstance(server_registry, dict) or not server_registry:
-            raise ValueError("Server registry must be a non-empty dictionary.")
-        
-        self.flight_demand = flight_demand
+    """
+    arrivals        : pd.Series of passengers per bin, indexed by a regular pd.DatetimeIndex
+    server_registry : {key: {"label", "priority", "dist", ...}}; processing times in minutes
+    """
+    def __init__(self, arrivals: pd.Series, server_registry: dict[str, dict]):
+        if not isinstance(arrivals, pd.Series) or not isinstance(arrivals.index, pd.DatetimeIndex):
+            raise TypeError("arrivals must be a pd.Series indexed by a pd.DatetimeIndex")
+        if (arrivals < 0).any():
+            raise ValueError("arrivals must be >= 0")
+        if not server_registry:
+            raise ValueError("server_registry cannot be empty.")
+
+        self.arrivals = arrivals.astype(float)
+        self.time_values: pd.DatetimeIndex = arrivals.index
+        self.bin_duration = self._regular_step(self.time_values)
+        self.bin_minutes = self.bin_duration.total_seconds() / 60.0
+
         self.server_registry = server_registry
+        self.server_labels = sort_labels_by_priority(server_registry)
+        self.rate_by_label = get_processing_rate_by_label(server_registry, self.bin_minutes)
 
-    def run(self, L: float, scale: float, alpha: float, base_seed: int):
+        self.demand_grid = arrivals_to_demand_grid(self.arrivals.to_numpy(), mean_processing_rate(server_registry), self.bin_minutes)
 
-        self.arrival_scenarios = ArrivalGenerator().generate_scenarios(
-                            flight_demand=self.flight_demand,
-                            n_scenarios=1,
-                            base_seed=base_seed
-                        )
+        self.results: LanePlannerResults | None = None
+        self.report: CoverageReport | None = None
 
-        # generate arrivals for each scenario
-        self.df_arrivals = self._build_arrival_profiles()
+    def run(self, L: float, alpha: float, K_total: int, exact: bool = False) -> LanePlannerResults:
+        """
+        L       : shift length in hours (converted to a whole number of bins)
+        alpha   : penalty per unit of idle capacity (objective = covered demand - alpha * idle)
+        K_total : total number of shifts shared among the servers
+        exact   : exact DP for the budget split instead of the greedy one
 
-        mean_processing_rate = self._get_mean_processing_rate()
+        results.df_curves has one row per bin with columns
+            time        bin start
+            demand      passengers arriving in the bin
+            processing  passengers the open servers can process in the bin (sum of their own rates)
+            servers     tuple of the labels open in the bin
+        """
+        if L <= 0:
+            raise ValueError("L must be > 0 (hours).")
+        if alpha < 0:
+            raise ValueError("alpha must be >= 0.")
+        if int(K_total) != K_total or K_total < 0:
+            raise ValueError("K_total must be an integer >= 0.")
+        K_total = int(K_total)
 
-        # optimize
-        logger.info(f"[SecurityLanePlanner] Launching  optimization: L={L}, scale={scale}, alpha={alpha}")
+        bin_hours = self.bin_minutes / 60.0
+        L_cells = max(1, math.floor(L / bin_hours + 0.5))
 
-        self._base_grid, self._base_arrival_curve = self._aggregate_arrivals(arrival_scenarios_dict, mean_processing_rate)
+        # only as many counter rows as there are servers to staff them
+        n_rows = self.demand_grid.shape[0]
+        n_usable = min(n_rows, len(self.server_labels))
+        if n_usable < n_rows:
+            logger.warning(
+                "[SecurityLanePlanner] demand needs up to %d servers but the registry has %d: "
+                "the demand of the upper %d row(s) (%.2f counter-bins) cannot be served.",
+                n_rows, n_usable, n_rows - n_usable, float(self.demand_grid[n_usable:].sum()),
+            )
+        grid = self.demand_grid[:n_usable]
+        labels = self.server_labels[:n_usable]
 
-        self.lanes_optimizer = LanesOptimizer(
-            arrival_scenarios_dict=self.arrival_scenarios,
-            mean_processing_rate=mean_processing_rate
-        )
+        # ---- optimisation ----
+        curve = solve_coverage_batch(grid, L_cells, alpha, return_curve=True)
+        alloc = allocate_budget(curve, K_total, exact=exact)
+        sols = solve_allocated(grid, L_cells, alpha, alloc)
 
-        self.df_alloc, self.df_requirements = self.lanes_optimizer.optimize(L=L, scale=scale, alpha=alpha)
+        row_labels = list(self.server_labels[:n_usable]) + ["no server"] * (n_rows - n_usable)
+        self.report = coverage_report(self.demand_grid, sols, L_cells, self.time_values, row_labels)
 
-        # get server labels by priority for the intervals
-        server_labels = sort_labels_by_priority(self.server_registry)
-        rate_by_label, _ = get_processing_rate_by_label(self.server_registry)
+        # ---- server schedule: row c is staffed by the c-th server in priority order ----
+        schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]] = {}
+        for label, sol in zip(labels, sols):
+            if sol.n_rects == 0:
+                continue
+            schedule[label] = [
+                (
+                    self.time_values[int(s0)].to_pydatetime(),
+                    (self.time_values[int(s0)] + L_cells * self.bin_duration).to_pydatetime(),
+                )
+                for s0 in sorted(sol.starts)
+            ]
 
-        self.server_schedule = self._alloc_to_server_schedule(server_labels=server_labels)
-
-        self.df_requirements["server_labels"] = self._server_labels_per_bin(
-            server_schedule=self.server_schedule,
-            server_labels=server_labels,
-            time_values=self.df_requirements["time"],
-        )
-
-        self.df_requirements["processing_rate"] = (
-            self.df_requirements["server_labels"].apply(lambda labels: sum(rate_by_label[label] for label in labels))
-        )
+        # ---- curves, from the same coverage the schedule comes from ----
+        extra = L_cells - 1
+        time_ext = self.time_values
+        if extra:
+            time_ext = time_ext.append(pd.date_range(self.time_values[-1] + self.bin_duration, periods=extra, freq=self.bin_duration))
+        active = np.vstack([s.coverage for s in sols])                    # (n_usable, T + extra)
+        rates = np.array([self.rate_by_label[label] for label in labels])
+        df_curves = pd.DataFrame({
+            "time": time_ext,
+            "demand": np.concatenate([self.arrivals.to_numpy(), np.zeros(extra)]),
+            "processing": rates @ active,
+            "servers": pd.Series(
+                [tuple(labels[c] for c in np.flatnonzero(active[:, t])) for t in range(active.shape[1])],
+                dtype=object,
+            ),
+        })
 
         self.results = LanePlannerResults(
             L=L,
-            scale=scale,
+            L_cells=L_cells,
             alpha=alpha,
-            grid=self.lanes_optimizer.grid,
-            df_alloc=self.df_alloc,
-            df_requirements=self.df_requirements,
-            server_schedule=self.server_schedule,
-            df_arrivals=self.df_arrivals
+            K_total=K_total,
+            bin_minutes=self.bin_minutes,
+            demand_grid=self.demand_grid,
+            server_labels=tuple(labels),
+            server_schedule=schedule,
+            df_curves=df_curves,
         )
+        return self.results
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _regular_step(index: pd.DatetimeIndex) -> pd.Timedelta:
+        if len(index) < 2:
+            raise ValueError("arrivals needs at least 2 bins to infer the bin length.")
+        steps = np.diff(index.values)
+        if not (steps == steps[0]).all():
+            raise ValueError("the time index of arrivals must be regular (constant bin length).")
+        return pd.Timedelta(steps[0])
 
 
-
-    
-
-    def _alloc_to_server_schedule(self, server_labels: list[str]) -> dict[str, list[tuple]]:
-        """
-        Convert the allocation DataFrame to a server schedule dictionary.
-        Each server label will have a list of tuples representing the start and end times of its allocated intervals.
-        The number of server_labels available is treated as an upper bound, not a hard requirement. 
-        """
-        df_alloc = self.df_alloc
-
-        if df_alloc.empty:
-            return {}
-
-        n_labels = len(server_labels)
-        max_y = int(df_alloc["y"].max())
-
-        if max_y >= n_labels:
-            dropped = int((df_alloc["y"] >= n_labels).sum())
-            logger.warning(
-                f"[SecurityLanePlanner] Optimizer allocated rows up to y={max_y}, "
-                f"but only {n_labels} server_labels are available in the registry. "
-                f"Dropping {dropped} allocated interval(s) beyond the available servers."
-            )
-            df_alloc = df_alloc[df_alloc["y"] < n_labels]
-
-        if df_alloc.empty:
-            return {}
-
-        server_schedule: dict[str, list[tuple]] = {}
-
-        for y, group in df_alloc.groupby("y"):
-            label = server_labels[int(y)]
-            server_schedule[label] = sorted(
-                (pd.Timestamp(start).to_pydatetime(), pd.Timestamp(end).to_pydatetime())
-                for start, end in zip(group["start_time"], group["end_time"])
-            )
-
-        return server_schedule
-    
-    def _server_labels_per_bin(
-        self,
-        server_schedule: dict[str, list[tuple]],
-        server_labels: list[str],
-        time_values: pd.Series,
-    ) -> list[tuple]:
-        """
-        Per ogni bin di df_requirements, quali server_labels sono attivi in quel
-        momento, letti direttamente da server_schedule - non serve piu'
-        ricostruire i list[Interval] condivisi solo per questo calcolo interno.
-        """
-        time_values = pd.to_datetime(time_values)
-        n = len(time_values)
-
-        active_matrix = np.zeros((len(server_labels), n), dtype=bool)
-
-        for row, label in enumerate(server_labels):
-            periods = server_schedule.get(label)
-            if not periods:
-                continue
-
-            starts = [pd.Timestamp(s) for s, _ in periods]
-            ends = [pd.Timestamp(e) for _, e in periods]
-
-            interval_index = pd.IntervalIndex.from_arrays(starts, ends, closed="left")
-            active_matrix[row] = interval_index.get_indexer(time_values) >= 0
-
-        return [
-            tuple(server_labels[row] for row in range(len(server_labels)) if active_matrix[row, col])
-            for col in range(n)
-        ]
-
-    def _build_arrival_profiles(self, timebin_minutes: int = 15) -> pd.DataFrame:
-
-        arrival_scenarios = self.arrival_scenarios
-        flight_demand = self.flight_demand
-
-        freq = f"{timebin_minutes}min"
-
-        flight_metadata = pd.DataFrame(
-            [
-                {
-                    "flight_key": flight.flight_key,
-                    "flight_number": flight.flight_number,
-                    "flight_departure_dt": pd.Timestamp(
-                        flight.departure_dt
-                    ),
-                }
-                for flight in flight_demand
-            ]
-        )
-
-        if flight_metadata["flight_key"].duplicated().any():
-            duplicate_keys = (
-                flight_metadata.loc[
-                    flight_metadata["flight_key"].duplicated(keep=False),
-                    "flight_key",
-                ]
-                .unique()
-                .tolist()
-            )
-
-            raise ValueError(f"Duplicate flight_key values found: {duplicate_keys[:5]}")
-
-        rows = []
-
-        for scenario in arrival_scenarios.values():
-            for passenger in scenario.passengers:
-                rows.append(
-                    {
-                        "scenario_id": scenario.scenario_id,
-                        "flight_key": passenger.flight_key,
-                        "arrival_dt": pd.Timestamp(passenger.arrival_dt),
-                    }
-                )
-
-        if not rows:
-            return pd.DataFrame(
-                columns=[
-                    "aggregation_level",
-                    "flight_key",
-                    "flight_number",
-                    "flight_departure_dt",
-                    "time",
-                    "median",
-                    "p5",
-                    "p25",
-                    "p75",
-                    "p95",
-                ]
-            )
-
-        df = pd.DataFrame(rows)
-        df["time"] = df["arrival_dt"].dt.floor(freq)
-
-        scenario_ids = sorted(scenario.scenario_id for scenario in arrival_scenarios.values())
-
-        flight_keys = flight_metadata["flight_key"].tolist()
-
-        start = df["time"].min() - pd.Timedelta(minutes=timebin_minutes)
-        end = df["time"].max() + pd.Timedelta(minutes= 2 * timebin_minutes)
-
-        time_axis = pd.date_range(
-            start=start,
-            end=end,
-            freq=freq,
-            inclusive="left",
-        )
-
-        all_counts = (
-            df.groupby(["scenario_id", "time"])
-            .size()
-            .rename("arrivals")
-        )
-
-        all_index = pd.MultiIndex.from_product(
-            [scenario_ids, time_axis],
-            names=["scenario_id", "time"],
-        )
-
-        all_counts = (
-            all_counts
-            .reindex(all_index, fill_value=0)
-            .reset_index()
-        )
-
-        flight_counts = (
-            df.groupby(["scenario_id", "flight_key", "time"])
-            .size()
-            .rename("arrivals")
-        )
-
-        flight_index = pd.MultiIndex.from_product(
-            [scenario_ids, flight_keys, time_axis],
-            names=["scenario_id", "flight_key", "time"],
-        )
-
-        flight_counts = (
-            flight_counts
-            .reindex(flight_index, fill_value=0)
-            .reset_index()
-        )
-
-        def aggregate_stats(counts: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
-            return (
-                counts
-                .groupby(group_columns)["arrivals"]
-                .quantile([0.05, 0.25, 0.5, 0.75, 0.95])
-                .unstack()
-                .rename(columns={0.05: "p5", 0.25: "p25", 0.5: "median", 0.75: "p75", 0.95: "p95"})
-                .reset_index()
-                .sort_values(group_columns)
-                .reset_index(drop=True)
-            )
-
-        df_all = aggregate_stats(
-            counts=all_counts,
-            group_columns=["time"],
-        )
-
-        df_all["aggregation_level"] = "all"
-
-        df_by_flight = aggregate_stats(
-            counts=flight_counts,
-            group_columns=["flight_key", "time"],
-        )
-
-        df_by_flight["aggregation_level"] = "flight"
-
-        df_arrivals = pd.concat(
-            [
-                df_all,
-                df_by_flight,
-            ],
-            ignore_index=True,
-            sort=False,
-        )
-
-        df_arrivals = df_arrivals.merge(
-            flight_metadata,
-            on="flight_key",
-            how="left",
-            validate="many_to_one",
-        )
-
-        df_arrivals = (
-            df_arrivals[
-                [
-                    "aggregation_level",
-                    "flight_key",
-                    "flight_number",
-                    "flight_departure_dt",
-                    "time",
-                    "median",
-                    "p5",
-                    "p25",
-                    "p75",
-                    "p95",
-                ]
-            ]
-            .sort_values(
-                ["aggregation_level", "flight_departure_dt", "time"],
-                na_position="first",
-            )
-            .reset_index(drop=True)
-        )
-
-        return df_arrivals
-
-    def _get_mean_processing_rate(self) -> float:
-        """
-        Compute the mean processing rate across all servers.
-        """
-
-        rates = []
-
-        for server_label, params in self.server_registry.items():
-
-            dist = params["dist"]
-
-            if dist == "gamma":
-                mean_processing_time = (
-                    params.get("shift", 0.0)
-                    + params["shape"] * params["scale"]
-                )
-
-            elif dist == "gaussian":
-                mean_processing_time = (
-                    params.get("shift", 0.0)
-                    + params["mean"]
-                )
-
-            elif dist == "exponential":
-                mean_processing_time = (
-                    params.get("shift", 0.0)
-                    + params["scale"]
-                )
-
-            else:
-                raise ValueError(f"Unsupported processing distribution for server {server_label}: {dist}")
-
-            if mean_processing_time <= 0:
-                raise ValueError(f"Mean processing time for server {server_label} must be positive.")
-
-            rates.append(60 / mean_processing_time)
-
-        return float(np.mean(rates))
 
 @dataclasses.dataclass
 class SecuritySimulatorResults:

@@ -442,6 +442,9 @@ def plot_grid_overlay(grid, rectangles, time_values, bin_minutes=None):
     fig.tight_layout()
     plt.show()
 
+def _step(ax, x, y, **kw):
+    return ax.step(x, y, where="post", **kw)
+
 def plot_all(df, df_kpis=None, date=None):
 
     # filter dataframes by date
@@ -543,7 +546,7 @@ def plot_all(df, df_kpis=None, date=None):
         expected_qtime_p25 = df_timeline['expected_qtime_min_p25']
         expected_qtime_p75 = df_timeline['expected_qtime_min_p75']
     else:
-        expected_qtime_mean = None
+        expected_qtime_median = df_timeline['expected_qtime_min']
         expected_qtime_p25 = None
         expected_qtime_p75 = None
 
@@ -553,13 +556,13 @@ def plot_all(df, df_kpis=None, date=None):
     add_kpi_cells(fig, df_kpis)
 
     # plot rates
-    line1,= ax1.plot(x, arrival_rate_median.values, color='blue', alpha=0.5, linestyle='-', label='Arrival Rate')
-    
-    if arrival_rate_q25 is not None and arrival_rate_q75 is not None:
-        ax1.fill_between(x, arrival_rate_q25, arrival_rate_q75,
-                          color='blue', alpha=0.2)
-    line2,= ax1.plot(x, theo_processing_rate.values, color='green', alpha=0.7, linestyle='-', label='Theoretical average processing Rate')
+    line1, = _step(ax1, x, arrival_rate_median.values, color='blue', alpha=0.5, linestyle='-', label='Arrival Rate')
 
+    if arrival_rate_q25 is not None and arrival_rate_q75 is not None:
+        ax1.fill_between(x, arrival_rate_q25, arrival_rate_q75, step="post",
+                          color='blue', alpha=0.2)
+        
+    line2, = _step(ax1, x, theo_processing_rate.values, color='green', alpha=0.7, linestyle='-', label='Theoretical average processing Rate')
     ax1.set_ylabel('pax')
     ax1.grid(axis='x', linestyle='-', alpha=0.5, zorder=1)
     ax1.set_ylim(bottom=0)
@@ -569,16 +572,17 @@ def plot_all(df, df_kpis=None, date=None):
     ax1.legend(lines, labels, loc='upper left')
 
     # plot queue
-    line1,= ax2.plot(x, queue_median.values, color='royalblue', label='Queue Length')
+    line1, = _step(ax2, x, queue_median.values, color='royalblue', label='Queue Length')
+
     if queue_q25 is not None and queue_q75 is not None:
-        ax2.fill_between(x, queue_q25, queue_q75,
+        ax2.fill_between(x, queue_q25, queue_q75, step="post",
                          color='royalblue', alpha=0.2)
     ax2.set_ylabel('# of pax')
     ax2b = ax2.twinx()
-    line2,= ax2b.plot(x, processing_rate_median.values, color='orange', label='Processing Rate')
+    line2,= _step(ax2b, x, processing_rate_median.values, color='orange', label='Processing Rate')
     
     if processing_rate_q25 is not None and processing_rate_q75 is not None:
-        ax2b.fill_between(x, processing_rate_q25, processing_rate_q75,
+        ax2b.fill_between(x, processing_rate_q25, processing_rate_q75, step="post",
                         color='orange', alpha=0.2)
     ax2b.set_ylabel('Processing rate')
     
@@ -592,11 +596,11 @@ def plot_all(df, df_kpis=None, date=None):
     ax2.legend(lines, labels, loc='upper left')
 
     # plot servers
-    line1,= ax3.plot(x, server_median.values, color='salmon', alpha=0.7, linestyle='-', label='Busy Servers')
+    line1,= _step(ax3, x, server_median.values, color='salmon', alpha=0.7, linestyle='-', label='Busy Servers')
     if server_q25 is not None and server_q75 is not None:
-        ax3.fill_between(x, server_q25, server_q75,
+        ax3.fill_between(x, server_q25, server_q75, step="post",
                          color='salmon', alpha=0.2)
-    line2,= ax3.plot(x, capacity.values, color='red', alpha=0.7, linestyle='-', label='Capacity')
+    line2,= _step(ax3, x, capacity.values, color='red', alpha=0.7, linestyle='-', label='Capacity')
     ax3.set_ylabel('# servers')
     ax3.grid(axis='x', linestyle='-', alpha=0.5, zorder=1)
     ax3.tick_params(axis='y')
@@ -607,9 +611,9 @@ def plot_all(df, df_kpis=None, date=None):
     ax3.legend(lines, labels, loc='upper left')
 
     # plot expected queue time
-    line1,= ax4.plot(x, expected_qtime_median.values, color='salmon', alpha=0.7, linestyle='-', label='Expected Queue Time')
+    line1,= _step(ax4, x, expected_qtime_median.values, color='salmon', alpha=0.7, linestyle='-', label='Expected Queue Time')
     if expected_qtime_p25 is not None and expected_qtime_p75 is not None:
-        ax4.fill_between(x, expected_qtime_p25, expected_qtime_p75,
+        ax4.fill_between(x, expected_qtime_p25, expected_qtime_p75, step="post",
                          color='salmon', alpha=0.2)
 
     ax4.set_ylabel('Minutes')
