@@ -141,65 +141,59 @@ def operational_service_date(moment: dt.datetime, cutoff_hour: int = 3) -> dt.da
 
     return moment.date()
 
-# parsing registry
+# server registry helpers
+def _label_of(key: str, params: dict) -> str:
+    return str(params.get("label", key))
+
+def _mean_processing_time(params: dict, label: str) -> float:
+    """Mean processing time of one passenger, in minutes."""
+    dist = params["dist"]
+    shift = params.get("shift", 0.0)
+    if dist == "gamma":
+        t = shift + params["shape"] * params["scale"]
+    elif dist == "gaussian":
+        t = shift + params["mean"]
+    elif dist == "exponential":
+        t = shift + params["scale"]
+    else:
+        raise ValueError(f"Unsupported processing distribution for server {label}: {dist}")
+    if t <= 0:
+        raise ValueError(f"Mean processing time for server {label} must be positive.")
+    return float(t)
+
+def mean_processing_rate(server_registry: dict[str, dict]) -> float:
+    """Mean over the servers of their processing rate, in pax per hour."""
+    if not server_registry:
+        raise ValueError("server_registry is empty.")
+    rates = [60.0 / _mean_processing_time(p, _label_of(k, p)) for k, p in server_registry.items()]
+    return float(np.mean(rates))
+
+def get_processing_rate_by_label(server_registry: dict[str, dict], bin_minutes: float = 15.0) -> dict[str, float]:
+    """Processing rate of each server, in pax per bin of bin_minutes, keyed by label."""
+    if not server_registry:
+        raise ValueError("server_registry is empty.")
+    return {
+        _label_of(k, p): bin_minutes / _mean_processing_time(p, _label_of(k, p))
+        for k, p in server_registry.items()
+    }, bin_minutes
 
 def label_sort_key(label):
     label = str(label).strip().upper()
-
     m = re.fullmatch(r"(\d+)([A-Z]*)", label)
-
     if m:
-        number = int(m.group(1))
-        suffix = m.group(2)
-        return (0, number, suffix)
-
+        return (0, int(m.group(1)), m.group(2))
     return (1, label)
     
 def sort_labels_by_priority(server_registry: dict[str, dict]) -> list[str]:
-    """
-    Sort server labels by priority and return the ordered list of labels.
-    """
-    ordered_servers = sorted(
-        server_registry.values(),
-        key=lambda server: (
-            int(server.get("priority", 10**9)),
-            label_sort_key(server["label"]),
-        ),
+    """Server labels ordered by priority (then by label); the first label is opened first."""
+    items = sorted(
+        server_registry.items(),
+        key=lambda kv: (int(kv[1].get("priority", 10**9)), label_sort_key(_label_of(*kv))),
     )
-
-    return [
-        str(server["label"])
-        for server in ordered_servers
-    ]
-
-def get_processing_rate_by_label(server_registry: dict[str, dict], duration: int = 15) -> dict[str, float]:
-    """
-    Compute the processing rate (pax per 15-minute bin) for each server, keyed by its label.
-    """
-    if not server_registry:
-        raise ValueError("Processing parameters are empty.")
-
-    rate_by_label = {}
-
-    for _, params in server_registry.items():
-        dist = params["dist"]
-        label = str(params["label"])
-
-        if dist == "gamma":
-            mean_processing_time = params.get("shift", 0.0) + params["shape"] * params["scale"]
-        elif dist == "gaussian":
-            mean_processing_time = params.get("shift", 0.0) + params["mean"]
-        elif dist == "exponential":
-            mean_processing_time = params.get("shift", 0.0) + params["scale"]
-        else:
-            raise ValueError(f"Unsupported processing distribution for server {label}: {dist}")
-
-        if mean_processing_time <= 0:
-            raise ValueError(f"Mean processing time for server {label} must be positive.")
-
-        rate_by_label[label] = duration / mean_processing_time
-
-    return rate_by_label, duration
+    labels = [_label_of(k, p) for k, p in items]
+    if len(set(labels)) != len(labels):
+        raise ValueError("server labels in the registry must be unique.")
+    return labels
 
 # parsing server schedule and intervals
 
@@ -280,7 +274,7 @@ def server_schedule_to_intervals(server_schedule: dict[str, list[tuple]]) -> lis
     raw_intervals = []
 
     for seg_start, seg_end in zip(breakpoints[:-1], breakpoints[1:]):
-        for sign, label in events_by_time.get(seg_start, []):
+        for sign, label in sorted(events_by_time.get(seg_start, []), key=lambda e: e[0]):
             active.add(label) if sign == 1 else active.discard(label)
 
         active_labels = tuple(sorted(active, key=label_sort_key))

@@ -9,6 +9,7 @@ import pandas as pd
 # float rounding noise when deciding whether a marginal gain is worth taking.
 _EPS = 1e-9
 
+# utilities
 def _check_demand_range(d: np.ndarray) -> None:
     """Demand is a load in [0, 1]: 1 = slot saturates the row, 0 = nobody needs it."""
     if d.size and (d.min() < -_EPS or d.max() > 1.0 + _EPS):
@@ -24,6 +25,7 @@ def extend_demand(demand: np.ndarray, L: int) -> np.ndarray:
     width = [(0, 0)] * (d.ndim - 1) + [(0, L - 1)]
     return np.pad(d, width)
 
+# output of solve_coverage and solve_coverage_batch
 @dataclass
 class Solution:
     """
@@ -58,7 +60,7 @@ def rectangle_values(
     allow_overhang: bool = True,
 ) -> np.ndarray:
     """
-    w[s] = value of a rectangle occupying slots [s, s+L-1].
+    Compute the value of placing a rectangle of length L at every possible start slot s.
 
     allow_overhang=True (default): the demand is first extended with L-1 empty slots on the right
     """
@@ -77,17 +79,16 @@ def rectangle_values(
     csum = np.concatenate(([0.0], np.cumsum(score)))
     return csum[L:] - csum[:-L]
 
-# ---------------------------------------------------------------------------
 # main solver
 def solve_coverage(
     demand: Sequence[float] | np.ndarray,
     L: int,
-    alpha: float = 1.0,
+    alpha: float,
     max_rects: Optional[int] = None,
     allow_overhang: bool = True,
 ) -> Solution:
     """
-    Exact DP.
+    Exact DP to place at most max_rects rectangles of length L on a 1-D demand vector, maximizing the objective.
 
     F[t, k] = best objective achievable using only rectangles entirely inside
               slots [0, t), with at most k of them.
@@ -108,8 +109,9 @@ def solve_coverage(
 
     wl = w.tolist()
 
-    # General case: F[t][k] = best objective using slots [0, t) with at most k rectangles. 
-    # take[t][k] records whether the optimum at (t, k) ends a rectangle right at t, so the backtrack below can recover the shift starts.
+    # F[t][k] = best objective using slots [0, t) with at most k rectangles. 
+    # take[t][k] records whether the optimum at (t, k) ends a rectangle right at t, 
+    # so the backtrack below can recover the shift starts.
     F: list[list[float]] = [[0.0] * (K + 1) for _ in range(T + 1)]
     take: list[list[bool]] = [[False] * (K + 1) for _ in range(T + 1)]
 
@@ -126,7 +128,7 @@ def solve_coverage(
                     cur[k] = cand
                     tk[k] = True
 
-    # ---- backtrack -------------------------------------------------------- #
+    # backtrack
     # Start at the final state (T, K) and undo whichever choice take[t][k]
     # recorded, shrinking t (and k, when a rectangle is placed) until t == 0.
     starts: list[int] = []
@@ -147,22 +149,19 @@ def solve_coverage(
     return Solution(float(F[T][K]), np.asarray(starts, dtype=int), coverage)._fill_stats(d)
 
 # ---------------------------------------------------------------------------
-# batched version: many demand vectors at once (values only)
+# batched version: many demand vectors at once
 def solve_coverage_batch(
     demand: np.ndarray,
     L: int,
-    alpha: float = 1.0,
+    alpha: float,
     max_rects: Optional[int] = None,
     return_curve: bool = False,
     allow_overhang: bool = True,
 ) -> np.ndarray:
     """
-    Same DP, vectorised over the first axis. demand: (N, T) -> values: (N,).
-    Rows are independent problems (e.g. the counters of the demand grid) and
-    demand is a load in [0, 1], binary or fractional.
+    For each row compute the best achievable value for every number of shifts k = 0..K
 
-    allow_overhang=True (default): demand is extended with L-1 empty slots on
-        the right first.
+    allow_overhang=True (default): demand is extended with L-1 empty slots on the right first.
 
     return_curve=False (default): each row solved independently with its own
         cap of `max_rects` rectangles -> (N,) array of optimal values.
@@ -207,14 +206,13 @@ class Allocation:
 
 def allocate_budget(curves: np.ndarray, K_total: int, exact: bool = False) -> Allocation:
     """
-    Split a single shared budget of K_total rectangles across N rows.
+    Split the shared budget K_total among the rows by maximising the sum of their curves
 
     curves is the (N, K+1) array from solve_coverage_batch(..., return_curve=True)
 
-    exact=False (default): greedy over marginal gains curves[i,k]-curves[i,k-1],
-    always awarding the next rectangle to whichever row's next unit is
-    currently most valuable. This is optimal if every row's curve is
-    concave (marginal gains non-increasing in k)
+    exact=False (default): greedy over marginal gains curves[i,k]-curves[i,k-1], always awarding 
+    the next rectangle to whichever row's next unit is currently most valuable. 
+    This is optimal if every row's curve is concave (marginal gains non-increasing in k)
     exact=True: exact DP over (rows, budget spent), O(N * K_total * K).
     """
     curves = np.asarray(curves, dtype=np.float64)
@@ -233,7 +231,7 @@ def _allocate_greedy(curves: np.ndarray, K_total: int) -> np.ndarray:
     K_max = Kp1 - 1
     k = np.zeros(N, dtype=int)
 
-    # Max-heap (via negated gain) of each row's *next* available increment.
+    # Max-heap (via negated gain) of each row's next available increment.
     heap: list[tuple[float, int]] = []
     for i in range(N):
         if K_max >= 1:
@@ -294,13 +292,7 @@ def solve_allocated(
     allow_overhang: bool = True,
     ) -> list[Solution]:
     """
-    Turn an Allocation into the actual per-row solutions.
-
-    allocate_budget only picks how many rectangles each row gets -- it works
-    off the value curve, not shift placement. This re-solves each row with
-    its assigned alloc.k[i] as max_rects to recover the concrete Solution
-    (same L, alpha, allow_overhang as used to build the curve passed to
-    allocate_budget).
+    Re-solve each row with its own number of shifts k to recover the actual start times.
     """
     D = np.asarray(demand, dtype=np.float64)
     if D.ndim != 2:
@@ -316,14 +308,16 @@ class CoverageReport:
     rows: pd.DataFrame
     total: pd.Series
 
-def coverage_report(D, sols, L, time_values=None, row_labels=None) -> CoverageReport:
+def coverage_report(D, sols, L, time_values, row_labels=None) -> CoverageReport:
     """
+    Prepare a report of the coverage DP solution, including per-block and per-row statistics.
+
     D    : (n_rows, T) demand grid in [0, 1]
     sols : list of Solution for the first len(sols) rows (the rows that have a server); the remaining
            rows of D have no server: they count as demand with 0 blocks, 0 coverage
-    row_labels : optional names for the index of `rows` (e.g. server labels, "no server" beyond)
     L    : shift length in bins
-    All quantities are in counter-bins (area of D). coverage = covered demand / demand area.
+    time_values : (T,) datetime-like, the start time of each bin
+    row_labels : optional names for the index of rows (e.g. server labels, "no server" beyond)
     """
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
@@ -332,9 +326,8 @@ def coverage_report(D, sols, L, time_values=None, row_labels=None) -> CoverageRe
     total_demand = float(D.sum())
     safe = lambda num, den: num / den if den > 0 else np.nan
  
-    if time_values is not None:
-        tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
-        step = tv.iloc[1] - tv.iloc[0]
+    tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
+    step = tv.iloc[1] - tv.iloc[0]
  
     recs = []
     for c, sol in enumerate(sols):
@@ -342,8 +335,7 @@ def coverage_report(D, sols, L, time_values=None, row_labels=None) -> CoverageRe
             s0 = int(s0)
             covered = float(D[c, s0:s0 + L].sum())
             rec = dict(row=c, block=b, start_slot=s0, end_slot=s0 + L)
-            if time_values is not None:
-                rec.update(start_time=tv.iloc[s0], end_time=tv.iloc[s0] + L * step)
+            rec.update(start_time=tv.iloc[s0], end_time=tv.iloc[s0] + L * step)
             rec.update(
                 covered_demand=covered,
                 idle_capacity=L - covered,
@@ -352,8 +344,7 @@ def coverage_report(D, sols, L, time_values=None, row_labels=None) -> CoverageRe
             recs.append(rec)
     blocks = pd.DataFrame(recs)
     if blocks.empty:
-        blocks = pd.DataFrame(columns=["row", "block", "start_slot", "end_slot", "covered_demand",
-                                       "idle_capacity", "utilization"])
+        blocks = pd.DataFrame(columns=["row", "block", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization"])
  
     n_rows = D.shape[0]
     covered_by_row = blocks.groupby("row")["covered_demand"].sum().reindex(range(n_rows), fill_value=0.0)
@@ -381,6 +372,13 @@ def coverage_report(D, sols, L, time_values=None, row_labels=None) -> CoverageRe
         "coverage": safe(covered_tot, total_demand),
     })
     return CoverageReport(blocks=blocks, rows=rows, total=total)
+
+
+
+
+
+
+
 
 
 
