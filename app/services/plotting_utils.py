@@ -39,7 +39,7 @@ def _coverage_from_results(res):
             blocks.append((c, start, end))
     return D, cov, blocks, time_values
  
-def plot_grid_overlay(res):
+def plot_grid_overlay(res, show_second=True):
  
     D, cov, blocks, time_values = _coverage_from_results(res)
     n_rows, n_bins = D.shape
@@ -51,11 +51,16 @@ def plot_grid_overlay(res):
     edge = dict(edgecolor="lightgray", linewidth=0.3)
  
     # top: demand vs allocation per server; bottom: arrivals vs processing per bin (same x axis)
-    fig, (ax, ax_curves) = plt.subplots(
-        2, 1, figsize=(10, 0.3 * n_rows + 3), sharex=True,
-        gridspec_kw={"height_ratios": [1.5, 1]},
-    )
- 
+
+    if show_second:
+        fig, (ax, ax_curves) = plt.subplots(
+            2, 1, figsize=(10, 0.3 * n_rows + 3), sharex=True,
+            gridspec_kw={"height_ratios": [1.5, 1]},
+        )
+    else:
+        fig, ax = plt.subplots(figsize=(10, 0.3 * n_rows + 1))
+        ax_curves = None
+
     for c in range(n_rows):
         d, covered = D[c], cov[c]
         m = d > 1e-9
@@ -85,21 +90,30 @@ def plot_grid_overlay(res):
         ],
         loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9,
     )
- 
-    # bottom panel: step curves straight from df_curves (pax per bin)
-    ax_curves.stairs(res.df_curves["demand"].to_numpy(), x_edges, color="tab:blue", linewidth=1.5, label="arrivals")
-    ax_curves.stairs(res.df_curves["processing"].to_numpy(), x_edges, color="tab:green", linewidth=1.5, label="real processing")
-    ax_curves.set_ylim(bottom=0)
-    ax_curves.set_ylabel(f"pax per {res.bin_minutes:g} min")
-    ax_curves.grid(axis="y", color="lightgray", linewidth=0.5)
-    ax_curves.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9)
- 
-    ax_curves.set_xlim(x0[0], x0[-1] + width)
-    ax_curves.xaxis_date()
-    ax_curves.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-    ax_curves.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax_curves.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
-    ax_curves.set_xlabel("time")
+
+    if show_second:
+        # bottom panel: step curves straight from df_curves (pax per bin)
+        ax_curves.stairs(res.df_curves["demand"].to_numpy(), x_edges, color="tab:blue", linewidth=1.5, label="arrivals")
+        ax_curves.stairs(res.df_curves["processing"].to_numpy(), x_edges, color="tab:green", linewidth=1.5, label="real processing")
+        ax_curves.set_ylim(bottom=0)
+        ax_curves.set_ylabel(f"pax per {res.bin_minutes:g} min")
+        ax_curves.grid(axis="y", color="lightgray", linewidth=0.5)
+        ax_curves.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9)
+    
+        ax_curves.set_xlim(x0[0], x0[-1] + width)
+        ax_curves.xaxis_date()
+        ax_curves.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        ax_curves.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax_curves.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
+        ax_curves.set_xlabel("time")
+
+    else:
+        ax.set_xlim(x0[0], x0[-1] + width)
+        ax.xaxis_date()
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        ax.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
+        ax.set_xlabel("time")
 
     title = f"L = {res.L:g} h  |  alpha = {res.alpha:g}  |  coverage = {res.coverage:.1%}"
     fig.suptitle(title)

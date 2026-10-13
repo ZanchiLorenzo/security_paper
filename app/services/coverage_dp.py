@@ -308,7 +308,7 @@ class CoverageReport:
     rows: pd.DataFrame
     total: pd.Series
 
-def coverage_report(D, sols, L, time_values, row_labels=None) -> CoverageReport:
+def coverage_report(D, sols, L, time_values, row_labels=None, alpha=None) -> CoverageReport:
     """
     Prepare a report of the coverage DP solution, including per-block and per-row statistics.
 
@@ -318,10 +318,12 @@ def coverage_report(D, sols, L, time_values, row_labels=None) -> CoverageReport:
     L    : shift length in bins
     time_values : (T,) datetime-like, the start time of each bin
     row_labels : optional names for the index of rows (e.g. server labels, "no server" beyond)
+    alpha : optional, the alpha used to compute the solutions (for reporting only)
     """
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
         raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
+    with_obj = alpha is not None
     row_demand = D.sum(axis=1)
     total_demand = float(D.sum())
     safe = lambda num, den: num / den if den > 0 else np.nan
@@ -341,11 +343,14 @@ def coverage_report(D, sols, L, time_values, row_labels=None) -> CoverageReport:
                 idle_capacity=L - covered,
                 utilization=covered / L,
             )
+            if with_obj:                                           
+                rec["objective"] = covered - alpha * (L - covered)
             recs.append(rec)
     blocks = pd.DataFrame(recs)
     if blocks.empty:
-        blocks = pd.DataFrame(columns=["row", "block", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization"])
- 
+        cols = ["row", "block", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization"]
+        blocks = pd.DataFrame(columns=cols + (["objective"] if with_obj else []))
+
     n_rows = D.shape[0]
     covered_by_row = blocks.groupby("row")["covered_demand"].sum().reindex(range(n_rows), fill_value=0.0)
     n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0)
@@ -359,22 +364,23 @@ def coverage_report(D, sols, L, time_values, row_labels=None) -> CoverageReport:
         "coverage": [safe(cv, dm) for cv, dm in zip(covered_by_row, row_demand)],
         "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
     }).rename_axis("row")
+    if with_obj:                                                       
+        rows["objective"] = rows["covered_demand"] - alpha * rows["idle_capacity"]
     rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
- 
+
     covered_tot = float(covered_by_row.sum())
     cap_tot = float(capacity.sum())
-    total = pd.Series({
+    total_dict = {                                                     
         "n_blocks": int(n_blocks.sum()),
         "demand": total_demand,
         "covered_demand": covered_tot,
         "missed_demand": max(total_demand - covered_tot, 0.0),
         "idle_capacity": cap_tot - covered_tot,
         "coverage": safe(covered_tot, total_demand),
-    })
-    return CoverageReport(blocks=blocks, rows=rows, total=total)
-
-
-
+    }
+    if with_obj:                          
+        total_dict["objective"] = covered_tot - alpha * (cap_tot - covered_tot)    
+    return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total_dict))
 
 
 

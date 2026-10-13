@@ -124,7 +124,7 @@ class SecurityPlanner:
 
         # get coverage report
         row_labels = list(self.server_labels[:n_usable]) + ["no server"] * (n_rows - n_usable)
-        self.report = coverage_report(self.demand_grid, sols, L_cells, self.time_values, row_labels)
+        self.report = coverage_report(self.demand_grid, sols, L_cells, self.time_values, row_labels, alpha)
 
         # server schedule: row c is staffed by the c-th server in priority order
         schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]] = {}
