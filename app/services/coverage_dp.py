@@ -5,14 +5,12 @@ from typing import Iterable, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-# Tolerance used (a) to validate that demand lies in [0, 1] and (b) to ignore
-# float rounding noise when deciding whether a marginal gain is worth taking.
-_EPS = 1e-9
+TIE_EPS = 1e-9
 
 # utilities
 def _check_demand_range(d: np.ndarray) -> None:
     """Demand is a load in [0, 1]: 1 = slot saturates the row, 0 = nobody needs it."""
-    if d.size and (d.min() < -_EPS or d.max() > 1.0 + _EPS):
+    if d.size and (d.min() < -TIE_EPS or d.max() > 1.0 + TIE_EPS):
         raise ValueError(f"demand must lie in [0, 1]")
 
 def extend_demand(demand: np.ndarray, L: int) -> np.ndarray:
@@ -101,13 +99,13 @@ def solve_coverage(
     T = d.size
     # w[s] = payoff of placing one rectangle at start s (see rectangle_values).
     w = rectangle_values(d, L, alpha, allow_overhang=False)
+    wl = w.tolist()
+
     # Cap on rectangles: at most T // L can physically fit; max_rects tightens that.
     K = (T // L) if max_rects is None else int(min(max_rects, T // L))
     if K <= 0:
         cov = np.zeros(T, dtype=bool)
         return Solution(0.0, np.empty(0, dtype=int), cov)._fill_stats(d)
-
-    wl = w.tolist()
 
     # F[t][k] = best objective using slots [0, t) with at most k rectangles. 
     # take[t][k] records whether the optimum at (t, k) ends a rectangle right at t, 
@@ -240,7 +238,7 @@ def _allocate_greedy(curves: np.ndarray, K_total: int) -> np.ndarray:
     taken = 0
     while heap and taken < K_total:
         neg_gain, i = heapq.heappop(heap)
-        if -neg_gain <= _EPS:
+        if -neg_gain <= TIE_EPS:
             break  # best remaining increment isn't worth taking (or is float noise)
         k[i] += 1
         taken += 1

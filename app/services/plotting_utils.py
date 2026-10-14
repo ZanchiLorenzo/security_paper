@@ -37,11 +37,18 @@ def _coverage_from_results(res):
             in_shift = (time_values >= pd.Timestamp(start)) & (time_values < pd.Timestamp(end))
             cov[c] |= in_shift.to_numpy()
             blocks.append((c, start, end))
-    return D, cov, blocks, time_values
+
+    total = float(D.sum())
+    C = float(D[cov].sum())
+    I = float((1.0 - D)[cov].sum()) 
+    obj = C - res.alpha * I
+    coverage = C / total if total > 0 else 1.0
+
+    return D, cov, obj, coverage, blocks, time_values
  
-def plot_grid_overlay(res, show_second=True):
+def plot_allocation(res, show_second=True):
  
-    D, cov, blocks, time_values = _coverage_from_results(res)
+    D, cov, obj, coverage, blocks, time_values = _coverage_from_results(res)
     n_rows, n_bins = D.shape
  
     x0 = mdates.date2num(time_values)                          # left edge of each bin
@@ -84,9 +91,9 @@ def plot_grid_overlay(res, show_second=True):
     ])
     ax.legend(
         handles=[
-            Patch(facecolor=ORANGE, edgecolor="lightgray", label="uncovered demand"),
+            Patch(facecolor=ORANGE, edgecolor="lightgray", label="uncovered"),
             Patch(facecolor=RED, edgecolor="lightgray", label="overshoot"),
-            Patch(facecolor=GREY, edgecolor="lightgray", label="covered demand"),
+            Patch(facecolor=GREY, edgecolor="lightgray", label="covered"),
         ],
         loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9,
     )
@@ -94,40 +101,42 @@ def plot_grid_overlay(res, show_second=True):
     if show_second:
         # bottom panel: step curves straight from df_curves (pax per bin)
         ax_curves.stairs(res.df_curves["demand"].to_numpy(), x_edges, color="tab:blue", linewidth=1.5, label="arrivals")
-        ax_curves.stairs(res.df_curves["processing"].to_numpy(), x_edges, color="tab:green", linewidth=1.5, label="real processing")
+        ax_curves.stairs(res.df_curves["processing"].to_numpy(), x_edges, color="tab:green", linewidth=1.5, label="processing")
         ax_curves.set_ylim(bottom=0)
-        ax_curves.set_ylabel(f"pax per {res.bin_minutes:g} min")
-        ax_curves.grid(axis="y", color="lightgray", linewidth=0.5)
+        ax_curves.set_ylabel(f"pax/{res.bin_minutes:g} mins")
         ax_curves.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9)
     
         ax_curves.set_xlim(x0[0], x0[-1] + width)
         ax_curves.xaxis_date()
-        ax_curves.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        ax_curves.xaxis.set_major_locator(mdates.HourLocator(interval=2))
         ax_curves.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
         ax_curves.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
-        ax_curves.set_xlabel("time")
 
     else:
         ax.set_xlim(x0[0], x0[-1] + width)
         ax.xaxis_date()
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+        ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
         ax.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
-        ax.set_xlabel("time")
 
-    title = f"L = {res.L:g} h  |  alpha = {res.alpha:g}  |  coverage = {res.coverage:.1%}"
+    title = f"L = {res.L:g} h  |  alpha = {res.alpha:g} | {len(blocks)} blocks  | obj={obj:.2f} | coverage = {coverage:.1%}"
     fig.suptitle(title)
- 
-    fig.autofmt_xdate()
+    fig.autofmt_xdate(rotation=90)
+
+    fig.canvas.draw()
+    targets = [ax] + ([ax_curves] if show_second else [])
+    for a in targets:
+        a.set_axisbelow(True)
+        a.grid(axis="x", which="major", linestyle="-", alpha=0.5, zorder=1)
+
     fig.tight_layout()
     plt.show()
-
 
 # simulation results plotting
 def _step(ax, x, y, **kw):
     return ax.step(x, y, where="post", **kw)
 
-def plot_all(df, df_kpis=None, date=None):
+def plot_simulation(df, df_kpis=None, date=None):
 
     # filter dataframes by date
     if date is not None:
@@ -137,11 +146,10 @@ def plot_all(df, df_kpis=None, date=None):
             df_kpis = pd.DataFrame([{
                 'date': pd.to_datetime(date).normalize() if date is not None else pd.NaT,
                 'qtime_p50': np.nan,
-                'queue_length_p50': np.nan,
-                'penalized_system_pct': np.nan,
-                'qtime_above_threshold_pct': np.nan,
-                'avg_utilization_pct': np.nan,
-                'full_utilization_pct': np.nan
+                'n_unserved': np.nan,
+                'qtime_above_15_pct': np.nan,
+                'qtime_above_30_pct': np.nan,
+                'qtime_above_60_pct': np.nan,
             }])
         df_kpis = df_kpis[df_kpis['date'].dt.normalize() == date_norm].copy()
     else:
@@ -151,11 +159,10 @@ def plot_all(df, df_kpis=None, date=None):
             df_kpis = pd.DataFrame([{
                 'date': pd.to_datetime(date).normalize() if date is not None else pd.NaT,
                 'qtime_p50': np.nan,
-                'queue_length_p50': np.nan,
-                'penalized_system_pct': np.nan,
-                'qtime_above_threshold_pct': np.nan,
-                'avg_utilization_pct': np.nan,
-                'full_utilization_pct': np.nan
+                'n_unserved': np.nan,
+                'qtime_above_15_pct': np.nan,
+                'qtime_above_30_pct': np.nan,
+                'qtime_above_60_pct': np.nan,
             }])
         df_kpis = df_kpis.copy()
     
@@ -233,7 +240,7 @@ def plot_all(df, df_kpis=None, date=None):
         expected_qtime_p95 = None
 
     # Plotting
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12,8), sharex=True, gridspec_kw={'height_ratios':[1,1,1,1]})
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(10, 8), sharex=True, gridspec_kw={'height_ratios':[1,1,1,1]})
 
     add_kpi_cells(fig, df_kpis)
 
@@ -268,7 +275,6 @@ def plot_all(df, df_kpis=None, date=None):
                         color='orange', alpha=0.2)
     ax2b.set_ylabel('Processing rate')
     
-    ax2.set_xlabel('Time')
     ax2.grid(axis='x', linestyle='-', alpha=0.5, zorder=1)
     ax2.set_ylim(bottom=0)
     ax2b.set_ylim(bottom=0)
@@ -307,28 +313,22 @@ def plot_all(df, df_kpis=None, date=None):
     labels = [line.get_label() for line in lines]
     ax4.legend(lines, labels, loc='upper left')
 
-    min_time = x.min()
-    max_time = x.max()
+    # time axis: same style as plot_allocation (sharex -> set it once, on the bottom panel)
+    step = x.diff().dropna().median() if len(x) > 1 else pd.Timedelta(minutes=15)
 
-    if max_time - min_time <= pd.Timedelta('4h'):
-        freq = '30min'
-    elif max_time - min_time <= pd.Timedelta('12h'):
-        freq = '60min'
-    else:
-        freq = '180min'
-    xticks = pd.date_range(start=min_time.ceil(freq), end=max_time, freq=freq)
-    
-    for ax in [ax1, ax2, ax3, ax4]:
-        ax.set_xticks(xticks)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax.tick_params(axis='x', labelbottom=True)
-    fig.subplots_adjust(top=0.95)
+    ax4.set_xlim(x.min(), x.max() + step)
+    ax4.xaxis_date()
+    ax4.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax4.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax4.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
+
+    fig.autofmt_xdate(rotation=90)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.show()
 
 def add_kpi_cells(fig, df_kpis):
 
-    labels = ['qtime_p50', 'queue_length_p50', 'penalized_system_pct', 'qtime_above_threshold_pct', 'avg_utilization_pct', 'full_utilization_pct']
+    labels = ['qtime_p50', 'n_unserved', 'qtime_above_15_pct', 'qtime_above_30_pct', 'qtime_above_60_pct']
     values = [df_kpis[label].iloc[0] for label in labels]
     n = len(labels)
 

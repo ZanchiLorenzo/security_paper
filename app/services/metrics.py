@@ -19,7 +19,9 @@ class SimulationKPIs:
     n_served: int
     n_unserved: int
     penalized_system_pct: float
-    qtime_above_threshold_pct: float
+    qtime_above_15_pct: float
+    qtime_above_30_pct: float
+    qtime_above_60_pct: float
     queue_length_p5: float
     queue_length_p25: float
     queue_length_p50: float
@@ -369,7 +371,9 @@ def _empty_kpis() -> SimulationKPIs:
         n_served=0,
         n_unserved=0,
         penalized_system_pct=0.0,
-        qtime_above_threshold_pct=0.0,
+        qtime_above_15_pct=0.0,
+        qtime_above_30_pct=0.0,
+        qtime_above_60_pct=0.0,
         queue_length_p5=0.0,
         queue_length_p25=0.0,
         queue_length_p50=0.0,
@@ -379,7 +383,7 @@ def _empty_kpis() -> SimulationKPIs:
         full_utilization_pct=0.0,
     )
 
-def get_kpis(result, df_timeline: pd.DataFrame, buffer_threshold: float,) -> SimulationKPIs:
+def get_kpis(result, df_timeline: pd.DataFrame) -> SimulationKPIs:
     pax_data = result.pax_data
 
     if not pax_data:
@@ -406,7 +410,10 @@ def get_kpis(result, df_timeline: pd.DataFrame, buffer_threshold: float,) -> Sim
     # pax waiting more than the threshold (minutes); a pax that never entered service has an unbounded wait, so it counts as waiting too long
     waits = np.array([p.start_min - p.arrival_min for p in pax_data if p.start_min is not None], dtype=float)
     n_never_started = n_arrived - waits.size
-    qtime_above_threshold_pct = 100 * (int(np.sum(waits > buffer_threshold)) + n_never_started) / n_arrived
+    qtime_above_15_pct = 100 * (int(np.sum(waits > 15)) + n_never_started) / n_arrived
+    qtime_above_30_pct = 100 * (int(np.sum(waits > 30)) + n_never_started) / n_arrived
+    qtime_above_60_pct = 100 * (int(np.sum(waits > 60)) + n_never_started) / n_arrived
+
 
     if not processed_pax:
         kpis = _empty_kpis()
@@ -479,7 +486,9 @@ def get_kpis(result, df_timeline: pd.DataFrame, buffer_threshold: float,) -> Sim
         n_served=n_served,
         n_unserved=n_unserved,
         penalized_system_pct=penalized_system_pct,
-        qtime_above_threshold_pct=qtime_above_threshold_pct,
+        qtime_above_15_pct=qtime_above_15_pct,
+        qtime_above_30_pct=qtime_above_30_pct,
+        qtime_above_60_pct=qtime_above_60_pct,
         queue_length_p5=queue_length_p5,
         queue_length_p25=queue_length_p25,
         queue_length_p50=queue_length_p50,

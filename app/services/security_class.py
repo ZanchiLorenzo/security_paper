@@ -198,7 +198,6 @@ class SimulationTask:
     intervals: list[Interval]               # intervals for the task
     server_registry: dict                   # server registry containing server processing parameters
     timebin: int                            # used for timeline aggregation
-    buffer_threshold: float                 # threshold for kpis computation  
     start_dt: dt.datetime                   # simulation start datetime, used to convert passenger arrival times to relative minutes 
 
 class SecuritySimulator:
@@ -229,7 +228,7 @@ class SecuritySimulator:
         operational_days = [pd.Timestamp(flight.departure_dt).normalize() for flight in self.flight_demand]
         self.day = pd.Series(operational_days).mode().iloc[0]
 
-    def run(self, n_scenarios: int, n_workers: int, timebin: int, buffer_threshold: int, base_seed: int):
+    def run(self, n_scenarios: int, n_workers: int, timebin: int, base_seed: int):
 
         # generate arrivals for each scenario
         self.arrival_scenarios = ArrivalGenerator().generate_scenarios(
@@ -240,7 +239,6 @@ class SecuritySimulator:
 
         self.n_workers = n_workers
         self.timebin = timebin
-        self.buffer_threshold = buffer_threshold
         self.base_seed = base_seed
 
         all_arrival_dts = [
@@ -276,7 +274,6 @@ class SecuritySimulator:
                     intervals=self.intervals,
                     server_registry=self.server_registry,
                     timebin=self.timebin,
-                    buffer_threshold=self.buffer_threshold,
                     start_dt=simulation_start_dt
                 )
             )
@@ -462,7 +459,6 @@ def single_scenario_worker(task: SimulationTask) -> dict:
     intervals = task.intervals
     server_registry = task.server_registry
     timebin = task.timebin
-    buffer_threshold = task.buffer_threshold
     seed = task.arrival_scenario.seed
     simulation_start_dt = task.start_dt
 
@@ -500,7 +496,7 @@ def single_scenario_worker(task: SimulationTask) -> dict:
     df_timeline = metrics.get_df_timeline(result, timebin=timebin, server_registry=server_registry)
     df_timeline["scenario_id"] = task.scenario_id
 
-    kpis = metrics.get_kpis(result, df_timeline=df_timeline, buffer_threshold=buffer_threshold)
+    kpis = metrics.get_kpis(result, df_timeline=df_timeline)
 
     df_pax = metrics.get_df_pax(result.pax_data, simulation_start_dt=simulation_start_dt)
     df_pax["simulation_start_dt"] = simulation_start_dt
