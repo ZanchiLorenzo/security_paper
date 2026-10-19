@@ -11,6 +11,13 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
 
 # planner results plotting
+def _shifts_label(blocks):
+    """'8×2h + 4×3h' : numero di turni per durata, dai blocchi (row, start, end)."""
+    hours = pd.Series([(pd.Timestamp(e) - pd.Timestamp(s)).total_seconds() / 3600
+                       for _, s, e in blocks]).round(2)
+    counts = hours.value_counts().sort_index()
+    return " + ".join(f"{n}×{h:g}h" for h, n in counts.items()) or "no shifts"
+
 def _coverage_from_results(res):
     """
     Rebuild, from the planner results only, what the plot needs:
@@ -38,6 +45,12 @@ def _coverage_from_results(res):
             cov[c] |= in_shift.to_numpy()
             blocks.append((c, start, end))
 
+    # trim the overhang: keep the day plus the bins after midnight that still have demand or an open shift
+    n_day = res.demand_grid.shape[1]
+    used = np.flatnonzero((D > 1e-9).any(axis=0) | cov.any(axis=0))
+    n_keep = max(n_day, int(used[-1]) + 1 if used.size else 0)
+    D, cov, time_values = D[:, :n_keep], cov[:, :n_keep], time_values.iloc[:n_keep].reset_index(drop=True)
+
     total = float(D.sum())
     C = float(D[cov].sum())
     I = float((1.0 - D)[cov].sum()) 
@@ -49,6 +62,9 @@ def _coverage_from_results(res):
 def plot_allocation(res, show_second=True):
  
     D, cov, obj, coverage, blocks, time_values = _coverage_from_results(res)
+
+    multi_length = len({round((pd.Timestamp(e) - pd.Timestamp(s)).total_seconds(), 0) for _, s, e in blocks}) > 1
+
     n_rows, n_bins = D.shape
  
     x0 = mdates.date2num(time_values)                          # left edge of each bin
@@ -82,6 +98,11 @@ def plot_allocation(res, show_second=True):
         xs, xe = mdates.date2num(start), mdates.date2num(end)
         ax.add_patch(Rectangle((xs, c), (xe - xs), 1, fill=False,
                                edgecolor="black", linewidth=1.6, zorder=3))
+
+        if multi_length:
+            h = (pd.Timestamp(end) - pd.Timestamp(start)).total_seconds() / 3600
+            ax.text((xs + xe) / 2, c + 0.5, f"{h:g}h", ha="center", va="center",
+                    fontsize=7, zorder=4)
  
     ax.set_ylim(0, n_rows)
     ax.set_yticks(np.arange(n_rows) + 0.5)
@@ -99,9 +120,11 @@ def plot_allocation(res, show_second=True):
     )
 
     if show_second:
+        curves = res.df_curves.iloc[:n_bins]
+
         # bottom panel: step curves straight from df_curves (pax per bin)
-        ax_curves.stairs(res.df_curves["demand"].to_numpy(), x_edges, color="tab:blue", linewidth=1.5, label="arrivals")
-        ax_curves.stairs(res.df_curves["processing"].to_numpy(), x_edges, color="tab:green", linewidth=1.5, label="processing")
+        ax_curves.stairs(curves["demand"].to_numpy(), x_edges, color="tab:blue", linewidth=1.5, label="arrivals")
+        ax_curves.stairs(curves["processing"].to_numpy(), x_edges, color="tab:green", linewidth=1.5, label="processing")
         ax_curves.set_ylim(bottom=0)
         ax_curves.set_ylabel(f"pax/{res.bin_minutes:g} mins")
         ax_curves.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=9)
@@ -119,7 +142,7 @@ def plot_allocation(res, show_second=True):
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
         ax.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 15, 30, 45]))
 
-    title = f"L = {res.L:g} h  |  alpha = {res.alpha:g} | {len(blocks)} blocks  | obj={obj:.2f} | coverage = {coverage:.1%}"
+    title = f"L: {_shifts_label(blocks)} |  alpha = {res.alpha:g} | {len(blocks)} blocks  | obj={obj:.2f} | coverage = {coverage:.1%}"
     fig.suptitle(title)
     fig.autofmt_xdate(rotation=90)
 

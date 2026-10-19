@@ -31,6 +31,8 @@ pyjwt = "^2.13.0"
 # Gruppo del solo compute service (app/compute_service): il backend non
 # importa piu' arrival_flow.py, quindi la sua immagine puo' fare
 # `poetry install --only main` e restare senza torch.
+pyomo = "^6.10.1"
+highspy = "^1.15.1"
 [tool.poetry.group.compute.dependencies]
 torch = {version = "^2.14.0", source = "pytorch-cpu"}
 zuko = "^1.6.0"
