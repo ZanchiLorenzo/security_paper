@@ -436,9 +436,12 @@ def _prepare(D: np.ndarray, lengths: Sequence[int], allow_overhang: bool):
     caps = _row_caps(T_ext, lengths)
     return D_ext, lengths, T_ext, n_starts, caps
 
-def _window_values(D_ext: np.ndarray, lengths: list, alpha: float, n_starts: list) -> list:
+def _window_values(D_ext: np.ndarray, lengths: list, alpha, n_starts: list) -> list:
     """W[i][r, s] = value of a rectangle of lengths[i] starting at s on row r:  sum_t ( d - alpha (1 - d) )."""
-    score = D_ext - alpha * (1.0 - D_ext)
+    a = np.asarray(alpha, dtype=np.float64)
+    if a.ndim == 1:
+        a = a[:, None] 
+    score = D_ext - a * (1.0 - D_ext)
     csum = np.concatenate([np.zeros((D_ext.shape[0], 1)), np.cumsum(score, axis=1)], axis=1)
     return [csum[:, l:l + n] - csum[:, :n] for l, n in zip(lengths, n_starts)]
 
@@ -798,11 +801,13 @@ def solve_allocated_multi(
         raise ValueError("demand must be (N, T)")
     if alloc.k.shape[0] != D.shape[0]:
         raise ValueError(f"alloc has {alloc.k.shape[0]} rows, demand has {D.shape[0]}")
+
+    alpha_rows = np.broadcast_to(np.asarray(alpha, dtype=np.float64), (D.shape[0],))
     return [
-        solve_coverage_multi(row, alloc.lengths, alpha,
+        solve_coverage_multi(row, alloc.lengths, float(a_r),
                              max_rects={l: int(k_row[j]) for j, l in enumerate(alloc.lengths)},
                              allow_overhang=allow_overhang)
-        for row, k_row in zip(D, alloc.k)
+        for row, k_row, a_r in zip(D, alloc.k, alpha_rows)
     ]
 
 # report

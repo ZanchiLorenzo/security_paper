@@ -219,11 +219,13 @@ class SecurityPlanner:
         grid = self.demand_grid[:n_usable]
         labels = self.server_labels[:n_usable]
 
+        alpha_rows = np.full(n_usable, float(alpha))
+    
         # ---- optimization ----
         logger.info(f"[SecurityPlanner] Launching multi-length allocation: lengths={lengths_h} h, alpha={alpha:.2f}")
-        curves = solve_coverage_batch_multi(grid, lengths_cells, alpha, allow_overhang=False)
+        curves = solve_coverage_batch_multi(grid, lengths_cells, alpha_rows, allow_overhang=False)
         alloc = allocate_milp(curves, lengths_cells, K_total=K_total, length_per_day=totals_cells)
-        sols = solve_allocated_multi(grid, alpha, alloc, allow_overhang=False)
+        sols = solve_allocated_multi(grid, alpha_rows, alloc, allow_overhang=False)
 
         row_labels = list(labels) + ["no server"] * (n_rows - n_usable)
         self.report = coverage_report_multi(self.demand_grid, sols, self.time_values, row_labels, alpha)
