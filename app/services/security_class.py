@@ -178,7 +178,7 @@ class SecurityPlanner:
         return self.results
 
     def run_multi(self, lengths: Sequence[float], alpha: float, K_total: int,
-                  length_totals: Optional[dict] = None) -> PlannerResults:
+                  length_totals: Optional[dict] = None, alpha_first: Optional[float] = None) -> PlannerResults:
         """
         lengths       : allowed shift lengths in hours, e.g. [2, 3]
         alpha         : penalty per unit of idle capacity
@@ -220,7 +220,10 @@ class SecurityPlanner:
         labels = self.server_labels[:n_usable]
 
         alpha_rows = np.full(n_usable, float(alpha))
-    
+
+        if alpha_first is not None:
+            alpha_rows[0] = float(alpha_first)
+   
         # ---- optimization ----
         logger.info(f"[SecurityPlanner] Launching multi-length allocation: lengths={lengths_h} h, alpha={alpha:.2f}")
         curves = solve_coverage_batch_multi(grid, lengths_cells, alpha_rows, allow_overhang=False)
@@ -228,7 +231,9 @@ class SecurityPlanner:
         sols = solve_allocated_multi(grid, alpha_rows, alloc, allow_overhang=False)
 
         row_labels = list(labels) + ["no server"] * (n_rows - n_usable)
-        self.report = coverage_report_multi(self.demand_grid, sols, self.time_values, row_labels, alpha)
+        alpha_report = np.append(alpha_rows, np.full(n_rows - n_usable, float(alpha)))
+
+        self.report = coverage_report_multi(self.demand_grid, sols, self.time_values, row_labels, alpha_report)
         schedule, df_curves = self._schedule_and_curves(sols, labels)
 
         self.results = PlannerResults(

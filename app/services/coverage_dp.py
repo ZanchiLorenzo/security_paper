@@ -823,7 +823,14 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
         raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
+    if alpha is not None:
+        alpha_arr = np.asarray(alpha, dtype=np.float64)
+        if alpha_arr.ndim > 1 or (alpha_arr.ndim == 1 and alpha_arr.size != np.shape(D)[0]) \
+                or not np.isfinite(alpha_arr).all() or (alpha_arr < 0).any():
+            raise ValueError("alpha must be a non-negative number or one value per row of D")
     with_obj = alpha is not None
+    alpha_r = np.broadcast_to(np.asarray(0.0 if alpha is None else alpha, dtype=np.float64), (D.shape[0],))
+
     row_demand = D.sum(axis=1)
     total_demand = float(D.sum())
     safe = lambda num, den: num / den if den > 0 else np.nan
@@ -840,7 +847,7 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
                        start_time=tv.iloc[s0], end_time=tv.iloc[s0] + l * step,
                        covered_demand=covered, idle_capacity=l - covered, utilization=covered / l)
             if with_obj:
-                rec["objective"] = covered - alpha * (l - covered)
+                rec["objective"]   = covered - alpha_r[c] * (l - covered)
             recs.append(rec)
     blocks = pd.DataFrame(recs)
     if blocks.empty:
@@ -863,7 +870,7 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
         "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
     }).rename_axis("row")
     if with_obj:
-        rows["objective"] = rows["covered_demand"] - alpha * rows["idle_capacity"]
+        rows["objective"]  = rows["covered_demand"] - alpha_r * rows["idle_capacity"]
     rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
 
     covered_tot, cap_tot = float(covered_by_row.sum()), float(capacity.sum())
@@ -876,7 +883,7 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
         "coverage": safe(covered_tot, total_demand),
     }
     if with_obj:
-        total["objective"] = covered_tot - alpha * (cap_tot - covered_tot)
+        total["objective"] = float((covered_by_row - alpha_r * (capacity - covered_by_row)).sum())
     for l, n in blocks.groupby("length").size().items():          # how many shifts of each length
         total[f"n_blocks_{int(l)}"] = int(n)
     return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
