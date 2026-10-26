@@ -29,11 +29,7 @@ def extend_demand(demand: np.ndarray, L: int) -> np.ndarray:
 # single L algorithm
 @dataclass
 class Solution:
-    """
-    Per-slot payoff of a covered slot is  d - alpha * (1 - d):
-    d is served, 1 - d is capacity paid for but not needed.
-    """
-    value: float                 # optimal objective = inside - alpha * outside
+    value: float                 # optimal objective = inside - theta * (inside + outside)
     starts: np.ndarray           # sorted start indices of the chosen rectangles
     coverage: np.ndarray         # bool[T], covered slots
     n_rects: int = field(init=False)
@@ -56,7 +52,7 @@ class Solution:
 def rectangle_values(
     demand: Sequence[float] | np.ndarray,
     L: int,
-    alpha: float,
+    theta: float,
     allow_overhang: bool = True,
 ) -> np.ndarray:
     """
@@ -75,14 +71,14 @@ def rectangle_values(
     T = d.size
     if L > T:
         raise ValueError(f"need L <= T when allow_overhang=False, got L={L}, T={T}")
-    score = d - alpha * (1.0 - d)              # per-slot payoff when covered
+    score = d - theta
     csum = np.concatenate(([0.0], np.cumsum(score)))
     return csum[L:] - csum[:-L]
 
 def solve_coverage(
     demand: Sequence[float] | np.ndarray,
     L: int,
-    alpha: float,
+    theta: float,
     max_rects: Optional[int] = None,
     allow_overhang: bool = True,
 ) -> Solution:
@@ -99,7 +95,7 @@ def solve_coverage(
         d = extend_demand(d, L)                # from here on T is the extended length
     T = d.size
     # w[s] = payoff of placing one rectangle at start s (see rectangle_values).
-    w = rectangle_values(d, L, alpha, allow_overhang=False)
+    w = rectangle_values(d, L, theta, allow_overhang=False)
     wl = w.tolist()
 
     # Cap on rectangles: at most T // L can physically fit; max_rects tightens that.
@@ -150,7 +146,7 @@ def solve_coverage(
 def solve_coverage_batch(
     demand: np.ndarray,
     L: int,
-    alpha: float,
+    theta: float,
     max_rects: Optional[int] = None,
     allow_overhang: bool = True,
 ) -> np.ndarray:
@@ -174,7 +170,7 @@ def solve_coverage_batch(
     N, T = D.shape
     if L > T:
         raise ValueError(f"need L <= T when allow_overhang=False, got L={L}, T={T}")
-    score = D - alpha * (1.0 - D)
+    score = D - theta
     csum = np.concatenate([np.zeros((N, 1)), np.cumsum(score, axis=1)], axis=1)
     W = csum[:, L:] - csum[:, :-L]                       # (N, T-L+1)
 
@@ -279,7 +275,7 @@ def _allocate_exact(curves: np.ndarray, K_total: int) -> np.ndarray:
 def solve_allocated(
     demand: np.ndarray,
     L: int,
-    alpha: float,
+    theta: float,
     alloc: Allocation,
     allow_overhang: bool = True,
     ) -> list[Solution]:
@@ -291,7 +287,7 @@ def solve_allocated(
         raise ValueError("demand must be (N, T)")
     if len(alloc.k) != D.shape[0]:
         raise ValueError(f"alloc has {len(alloc.k)} rows, demand has {D.shape[0]}")
-    return [solve_coverage(row, L, alpha, max_rects=int(k), allow_overhang=allow_overhang)
+    return [solve_coverage(row, L, theta, max_rects=int(k), allow_overhang=allow_overhang)
             for row, k in zip(D, alloc.k)]
 
 @dataclass
@@ -300,7 +296,7 @@ class CoverageReport:
     rows: pd.DataFrame
     total: pd.Series
 
-def coverage_report(D, sols, L, time_values, row_labels=None, alpha=None) -> CoverageReport:
+def coverage_report(D, sols, L, time_values, theta, row_labels=None) -> CoverageReport:
     """
     Prepare a report of the coverage DP solution, including per-block and per-row statistics.
 
@@ -310,12 +306,11 @@ def coverage_report(D, sols, L, time_values, row_labels=None, alpha=None) -> Cov
     L    : shift length in bins
     time_values : (T,) datetime-like, the start time of each bin
     row_labels : optional names for the index of rows (e.g. server labels, "no server" beyond)
-    alpha : optional, the alpha used to compute the solutions (for reporting only)
+    theta : the theta used to compute the solutions
     """
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
         raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
-    with_obj = alpha is not None
     row_demand = D.sum(axis=1)
     total_demand = float(D.sum())
     safe = lambda num, den: num / den if den > 0 else np.nan
@@ -334,14 +329,14 @@ def coverage_report(D, sols, L, time_values, row_labels=None, alpha=None) -> Cov
                 covered_demand=covered,
                 idle_capacity=L - covered,
                 utilization=covered / L,
+                objective=covered - theta * L
             )
-            if with_obj:                                           
-                rec["objective"] = covered - alpha * (L - covered)
+                                         
             recs.append(rec)
     blocks = pd.DataFrame(recs)
     if blocks.empty:
-        cols = ["row", "block", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization"]
-        blocks = pd.DataFrame(columns=cols + (["objective"] if with_obj else []))
+        cols = ["row", "block", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization", "objective"]
+        blocks = pd.DataFrame(columns=cols)
 
     n_rows = D.shape[0]
     covered_by_row = blocks.groupby("row")["covered_demand"].sum().reindex(range(n_rows), fill_value=0.0)
@@ -355,9 +350,8 @@ def coverage_report(D, sols, L, time_values, row_labels=None, alpha=None) -> Cov
         "idle_capacity": capacity - covered_by_row.to_numpy(),
         "coverage": [safe(cv, dm) for cv, dm in zip(covered_by_row, row_demand)],
         "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
+        "objective": covered_by_row.to_numpy() - theta * capacity,
     }).rename_axis("row")
-    if with_obj:                                                       
-        rows["objective"] = rows["covered_demand"] - alpha * rows["idle_capacity"]
     rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
 
     covered_tot = float(covered_by_row.sum())
@@ -369,9 +363,8 @@ def coverage_report(D, sols, L, time_values, row_labels=None, alpha=None) -> Cov
         "missed_demand": max(total_demand - covered_tot, 0.0),
         "idle_capacity": cap_tot - covered_tot,
         "coverage": safe(covered_tot, total_demand),
-    }
-    if with_obj:                          
-        total_dict["objective"] = covered_tot - alpha * (cap_tot - covered_tot)    
+        "objective": covered_tot - theta * cap_tot,
+    }   
     return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total_dict))
 
 # ---------------------------------------------------------------------------
@@ -382,7 +375,7 @@ Caps = Optional[Union[int, dict]]
 @dataclass
 class MultiSolution:
     """Same as Solution, plus the length of every rectangle."""
-    value: float                  # optimal objective = inside - alpha * outside
+    value: float                  # optimal objective = inside - theta * (inside + outside)
     starts: np.ndarray            # sorted start indices of the chosen rectangles
     lengths: np.ndarray           # length of each chosen rectangle, same order as starts
     coverage: np.ndarray          # bool[T_ext], covered slots
@@ -436,12 +429,12 @@ def _prepare(D: np.ndarray, lengths: Sequence[int], allow_overhang: bool):
     caps = _row_caps(T_ext, lengths)
     return D_ext, lengths, T_ext, n_starts, caps
 
-def _window_values(D_ext: np.ndarray, lengths: list, alpha, n_starts: list) -> list:
-    """W[i][r, s] = value of a rectangle of lengths[i] starting at s on row r:  sum_t ( d - alpha (1 - d) )."""
-    a = np.asarray(alpha, dtype=np.float64)
-    if a.ndim == 1:
-        a = a[:, None] 
-    score = D_ext - a * (1.0 - D_ext)
+def _window_values(D_ext: np.ndarray, lengths: list, theta, n_starts: list) -> list:
+    """W[i][r, s] = value of a rectangle of lengths[i] starting at s on row r:  sum_t ( d - theta)."""
+    theta_array = np.asarray(theta, dtype=np.float64)
+    if theta_array.ndim == 1:
+        theta_array = theta_array[:, None] 
+    score = D_ext - theta_array
     csum = np.concatenate([np.zeros((D_ext.shape[0], 1)), np.cumsum(score, axis=1)], axis=1)
     return [csum[:, l:l + n] - csum[:, :n] for l, n in zip(lengths, n_starts)]
 
@@ -458,12 +451,12 @@ def _check_state_space(cells: int, what: str, limit: int) -> None:
             f"{what}: state space is ~{cells:,} cells, over the {limit:,} guard. It grows multiplicatively "
             f"with the number of lengths: use fewer lengths"
         )
-
+    
 # one row DP
 def solve_coverage_multi(
     demand: Sequence[float] | np.ndarray,
     lengths: Sequence[int],
-    alpha: float,
+    theta: float,
     max_rects: Optional[dict] = None,  # {length: cap}: used by solve_allocated_multi
     allow_overhang: bool = True,
 ) -> MultiSolution:
@@ -497,7 +490,7 @@ def solve_coverage_multi(
         cov = np.zeros(T, dtype=bool)
         return MultiSolution(0.0, np.empty(0, dtype=int), np.empty(0, dtype=int), cov)._fill_stats(D[0])
 
-    W = _window_values(D, lengths, alpha, n_starts)
+    W = _window_values(D, lengths, theta, n_starts)
 
     F = np.zeros((T + 1,) + shape, dtype=np.float64)
     # take[t][state]: index of the length that ends a rectangle at t in that state, -1 = carry F[t-1]
@@ -547,7 +540,7 @@ def solve_coverage_multi(
 def solve_coverage_batch_multi(
     demand: np.ndarray,
     lengths: Sequence[int],
-    alpha: float,
+    theta: float,
     allow_overhang: bool = True,
 ) -> np.ndarray:
     """
@@ -569,7 +562,7 @@ def solve_coverage_batch_multi(
     if all(c == 0 for c in caps):
         return np.zeros((N,) + shape)
 
-    W = _window_values(D, lengths, alpha, n_starts)
+    W = _window_values(D, lengths, theta, n_starts)
     moves = [(i, l, *_axis_slices(m, i, lead=1)) for i, l in enumerate(lengths) if caps[i] > 0]
 
     buf = np.zeros((P, N) + shape, dtype=np.float64)      # buf[t % P] holds F[t]
@@ -787,7 +780,7 @@ def allocate_milp(
 
 def solve_allocated_multi(
     demand: np.ndarray,
-    alpha: float,
+    theta: float,
     alloc: MultiAllocation,
     allow_overhang: bool = True,
 ) -> list:
@@ -802,16 +795,16 @@ def solve_allocated_multi(
     if alloc.k.shape[0] != D.shape[0]:
         raise ValueError(f"alloc has {alloc.k.shape[0]} rows, demand has {D.shape[0]}")
 
-    alpha_rows = np.broadcast_to(np.asarray(alpha, dtype=np.float64), (D.shape[0],))
+    theta_rows = np.broadcast_to(np.asarray(theta, dtype=np.float64), (D.shape[0],))
     return [
-        solve_coverage_multi(row, alloc.lengths, float(a_r),
+        solve_coverage_multi(row, alloc.lengths, float(th_r),
                              max_rects={l: int(k_row[j]) for j, l in enumerate(alloc.lengths)},
                              allow_overhang=allow_overhang)
-        for row, k_row, a_r in zip(D, alloc.k, alpha_rows)
+        for row, k_row, th_r in zip(D, alloc.k, theta_rows)
     ]
 
 # report
-def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> CoverageReport:
+def coverage_report_multi(D, sols, time_values, theta, row_labels=None) -> CoverageReport:
     """
     Same report as coverage_report, with a length per block.
 
@@ -819,17 +812,19 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
     sols : list of MultiSolution for the first len(sols) rows (the rows with a server); the remaining
            rows have no server: demand with 0 blocks, 0 coverage
     time_values : (T,) datetime-like, start time of each bin
+    theta : the theta used to compute the solutions: a number or one value per row of D (None = no objective).
+            objective = covered demand - theta * capacity of the blocks
     """
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
         raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
-    if alpha is not None:
-        alpha_arr = np.asarray(alpha, dtype=np.float64)
-        if alpha_arr.ndim > 1 or (alpha_arr.ndim == 1 and alpha_arr.size != np.shape(D)[0]) \
-                or not np.isfinite(alpha_arr).all() or (alpha_arr < 0).any():
-            raise ValueError("alpha must be a non-negative number or one value per row of D")
-    with_obj = alpha is not None
-    alpha_r = np.broadcast_to(np.asarray(0.0 if alpha is None else alpha, dtype=np.float64), (D.shape[0],))
+    if theta is not None:
+        theta_array = np.asarray(theta, dtype=np.float64)
+        if theta_array.ndim > 1 or (theta_array.ndim == 1 and theta_array.size != np.shape(D)[0]) \
+                or not np.isfinite(theta_array).all() or (theta_array < 0).any() or (theta_array > 1).any():
+            raise ValueError("theta must be a number in [0, 1] or one such value per row of D")
+
+    theta_r = np.broadcast_to(np.asarray(0.0 if theta is None else theta, dtype=np.float64), (D.shape[0],))
 
     row_demand = D.sum(axis=1)
     total_demand = float(D.sum())
@@ -845,14 +840,14 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
             covered = float(D[c, s0:s0 + l].sum())
             rec = dict(row=c, block=b, length=l, start_slot=s0, end_slot=s0 + l,
                        start_time=tv.iloc[s0], end_time=tv.iloc[s0] + l * step,
-                       covered_demand=covered, idle_capacity=l - covered, utilization=covered / l)
-            if with_obj:
-                rec["objective"]   = covered - alpha_r[c] * (l - covered)
+                       covered_demand=covered, idle_capacity=l - covered, utilization=covered / l,
+                       objective=covered - theta_r[c] * l)
+        
             recs.append(rec)
     blocks = pd.DataFrame(recs)
     if blocks.empty:
-        cols = ["row", "block", "length", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization"]
-        blocks = pd.DataFrame(columns=cols + (["objective"] if with_obj else []))
+        cols = ["row", "block", "length", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization", "objective"]
+        blocks = pd.DataFrame(columns=cols)
 
     n_rows = D.shape[0]
     by_row = lambda col, fill: blocks.groupby("row")[col].sum().reindex(range(n_rows), fill_value=fill).to_numpy()
@@ -868,9 +863,9 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
         "idle_capacity": capacity - covered_by_row,
         "coverage": [safe(cv, dm) for cv, dm in zip(covered_by_row, row_demand)],
         "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
+        "objective": covered_by_row - theta_r * capacity,
     }).rename_axis("row")
-    if with_obj:
-        rows["objective"]  = rows["covered_demand"] - alpha_r * rows["idle_capacity"]
+
     rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
 
     covered_tot, cap_tot = float(covered_by_row.sum()), float(capacity.sum())
@@ -881,11 +876,8 @@ def coverage_report_multi(D, sols, time_values, row_labels=None, alpha=None) -> 
         "missed_demand": max(total_demand - covered_tot, 0.0),
         "idle_capacity": cap_tot - covered_tot,
         "coverage": safe(covered_tot, total_demand),
+        "objective": float((covered_by_row - theta_r * capacity).sum()),
     }
-    if with_obj:
-        total["objective"] = float((covered_by_row - alpha_r * (capacity - covered_by_row)).sum())
     for l, n in blocks.groupby("length").size().items():          # how many shifts of each length
         total[f"n_blocks_{int(l)}"] = int(n)
     return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
-
-

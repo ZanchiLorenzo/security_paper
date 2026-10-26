@@ -11,7 +11,8 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
 import json
 
-# planner results plotting
+GREY, ORANGE, RED, WHITE = "#9e9e9e", "#00b70f", "#ff0000", "#ffffff"
+
 def coverage_mask(blocks, labels, shape):
     """Boolean (n_rows, T) mask of covered cells."""
     row_of = {l: c for c, l in enumerate(labels)}
@@ -25,15 +26,20 @@ def coverage_mask(blocks, labels, shape):
             cov[row_of[label], s:s + l] = True
     return cov
 
-def coverage_from_arrays(D, blocks, labels, alpha):
-    """-> cov mask, objective = covered - alpha*idle, coverage = covered/total."""
+def coverage_from_arrays(D, blocks, labels, theta):
+    """-> cov mask, objective = covered - theta * capacity (theta: number or one value per row), coverage = covered/total."""
     D = np.asarray(D, dtype=np.float64)
     cov = coverage_mask(blocks, labels, D.shape)
+    theta_rows = np.asarray(theta, dtype=np.float64)
+    if theta_rows.ndim == 0:
+        theta_rows = np.full(D.shape[0], float(theta_rows))
+    elif theta_rows.size < D.shape[0]:                           # rows without a server never have blocks
+        theta_rows = np.pad(theta_rows, (0, D.shape[0] - theta_rows.size))
     total = float(D.sum())
     C = float(D[cov].sum())
-    I = float((1.0 - D)[cov].sum())
-    return cov, C - alpha * I, (C / total if total > 0 else 1.0)
- 
+    capacity = float((theta_rows[:, None] * cov).sum())          # sum over covered slots of theta_row
+    return cov, C - capacity, (C / total if total > 0 else 1.0)
+
 def processing_from_blocks(blocks, rate_by_label, T):
     """Capacity per bin (pax/bin) = sum of the rates of the open lanes."""
     out = np.zeros(T)
@@ -59,13 +65,13 @@ def parse_blocks(x):
     """JSON string or dict -> {label: [(start, length)]}"""
     d = json.loads(x) if isinstance(x, str) else x
     return {k: [tuple(int(v) for v in b) for b in bl] for k, bl in d.items()}
- 
+
 def shifts_label(blocks, bin_minutes):
     lens = pd.Series([l * bin_minutes / 60 for bl in blocks.values() for _, l in bl]).round(2)
     counts = lens.value_counts().sort_index()
     return " + ".join(f"{n}×{h:g}h" for h, n in counts.items()) or "no shifts"
- 
-def plot_blocks(D, blocks, labels, time_values, alpha, bin_minutes,
+
+def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
                 metrics=None, demand_curve=None, processing_curve=None,
                 show_second=True, title_prefix=None):
     D = np.asarray(D, dtype=np.float64)
@@ -74,33 +80,33 @@ def plot_blocks(D, blocks, labels, time_values, alpha, bin_minutes,
     n_rows, T = D.shape
     if len(time_values) != T:
         raise ValueError(f"time_values has {len(time_values)} entries, D has {T} bins")
- 
-    cov, obj, coverage = coverage_from_arrays(D, blocks, labels, alpha)
+
+    cov, obj, coverage = coverage_from_arrays(D, blocks, labels, theta)
     if metrics is not None:                                   # stored values win (title consistent with the df)
         obj = metrics.get("objective", obj)
         coverage = metrics.get("coverage", coverage)
- 
+
     flat = [(labels.index(l), s, ln) for l, bl in blocks.items() for s, ln in bl]
     multi_length = len({ln for _, _, ln in flat}) > 1
     show_second = show_second and demand_curve is not None and processing_curve is not None
- 
+
     x0 = mdates.date2num(time_values)
     width = bin_minutes / (24 * 60)
     x_edges = np.append(x0, x0[-1] + width)
     edge = dict(edgecolor="lightgray", linewidth=0.3)
- 
+
     if show_second:
-        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(10, 0.35 * n_rows + 5), sharex=True,
-                                      gridspec_kw={"height_ratios": [max(2, 0.35 * n_rows), 2]})
+        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(10, 0.45 * n_rows + 4), sharex=True,
+                                      gridspec_kw={"height_ratios": [max(2, 0.45 * n_rows), 2]})
     else:
-        fig, ax = plt.subplots(figsize=(10, 0.35 * n_rows + 2)); ax2 = None
- 
+        fig, ax = plt.subplots(figsize=(10, 0.45 * n_rows + 2)); ax2 = None
+
     for c in range(n_rows):
         d, k = D[c], cov[c]
-        ax.bar(x0, np.where(k, d, 0), width=width, bottom=c, align="edge", color='GREY', **edge)
-        ax.bar(x0, np.where(k, 1 - d, 0), width=width, bottom=c + np.where(k, d, 0), align="edge", color='RED', **edge)
-        ax.bar(x0, np.where(~k, d, 0), width=width, bottom=c, align="edge", color='ORANGE', **edge)
-        ax.bar(x0, np.where(~k, 1 - d, 0), width=width, bottom=c + np.where(~k, d, 0), align="edge", color='WHITE', **edge)
+        ax.bar(x0, np.where(k, d, 0), width=width, bottom=c, align="edge", color=GREY, **edge)
+        ax.bar(x0, np.where(k, 1 - d, 0), width=width, bottom=c + np.where(k, d, 0), align="edge", color=RED, **edge)
+        ax.bar(x0, np.where(~k, d, 0), width=width, bottom=c, align="edge", color=ORANGE, **edge)
+        ax.bar(x0, np.where(~k, 1 - d, 0), width=width, bottom=c + np.where(~k, d, 0), align="edge", color=WHITE, **edge)
     for c, s, ln in flat:
         ax.add_patch(Rectangle((x_edges[s], c), x_edges[s + ln] - x_edges[s], 1,
                                fill=False, edgecolor="black", linewidth=1.6))
@@ -108,56 +114,96 @@ def plot_blocks(D, blocks, labels, time_values, alpha, bin_minutes,
             ax.text((x_edges[s] + x_edges[s + ln]) / 2, c + 0.5, f"{ln * bin_minutes / 60:g}h",
                     ha="center", va="center", fontsize=8)
     ax.set_ylim(0, n_rows); ax.set_yticks(np.arange(n_rows) + 0.5)
-    ax.set_yticklabels([f"server {l}" for l in labels])
-    ax.set_xlabel("Time"); ax.set_ylabel("Server")
-    ax.legend(handles=[Patch(color='GREY', label="demand covered"), Patch(color='RED', label="idle capacity"),
-                       Patch(color='ORANGE', label="demand uncovered")], loc="upper right", fontsize=8)
- 
+    ax.set_yticklabels([f"server {labels[c]}" if c < len(labels) else "no server" for c in range(n_rows)])
+    ax.legend(handles=[Patch(color=GREY, label="demand covered"), Patch(color=RED, label="idle capacity"),
+                       Patch(color=ORANGE, label="demand uncovered")], loc="upper right", fontsize=8)
+
     if ax2 is not None:
         ax2.stairs(np.asarray(demand_curve) / bin_minutes, x_edges, label="demand", color="tab:blue")
         ax2.stairs(np.asarray(processing_curve) / bin_minutes, x_edges, label="processing", color="tab:green")
         ax2.set_ylabel("pax / min"); ax2.legend(fontsize=8)
- 
+
     axes = [ax] + ([ax2] if ax2 is not None else [])
     for a in axes:
         a.xaxis.set_major_locator(mdates.HourLocator())
         a.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
         a.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=range(0, 60, 15)))
+        a.set_axisbelow(True) 
         a.grid(axis="x", which="major", alpha=0.4)
-    title = (f"L: {shifts_label(blocks, bin_minutes)} |  alpha = {alpha:g}  | "
-             f"obj={obj:.2f} | coverage = {coverage:.2%}")
+    th = np.unique(np.asarray(theta, dtype=float))
+    th_txt = f"{th[0]:g}" if len(th) == 1 else f"{th.min():g}-{th.max():g}"
+    title = (f"L: {shifts_label(blocks, bin_minutes)} |  theta = {th_txt} | {len(flat)} blocks  | "
+             f"obj={obj:.2f} | coverage = {coverage:.1%}")
     fig.suptitle(f"{title_prefix} — {title}" if title_prefix else title)
     fig.autofmt_xdate(rotation=90)
     fig.tight_layout()
     plt.show()
- 
+
 def plot_allocation(res, show_second=True):
     """Backward-compatible wrapper: only extracts the minimal inputs from `res`."""
     tv = pd.to_datetime(res.df_curves["time"]).reset_index(drop=True)
     D = np.asarray(res.demand_grid, dtype=np.float64)
     tv = tv.iloc[:D.shape[1]]
     blocks = schedule_to_slot_blocks(res.server_schedule, tv)
-    plot_blocks(D, blocks, res.server_labels, tv, res.alpha, res.bin_minutes,
-                demand_curve=res.df_curves["demand"].to_numpy()[:D.shape[1]],
-                processing_curve=res.df_curves["processing"].to_numpy()[:D.shape[1]],
-                show_second=show_second)
- 
+    plot_blocks(D, blocks, res.server_labels, tv,
+                       (res.theta_rows if getattr(res, 'theta_rows', None) is not None else res.theta), res.bin_minutes,
+                       demand_curve=res.df_curves["demand"].to_numpy()[:D.shape[1]],
+                       processing_curve=res.df_curves["processing"].to_numpy()[:D.shape[1]],
+                       show_second=show_second)
+
 def plot_run_from_row(row, D, labels, time_values, bin_minutes, demand_curve=None,
-                      rate_by_label=None, show_second=True):
+                      rate_by_label=None, show_second=True, check=True):
     """
-    Plot a df_pert row: blocks come from row['blocks'], alpha/objective/coverage from the row itself.
+    Plot a df_pert row: blocks come from row['blocks'], theta/objective/coverage from the row itself.
     D, labels, time_values, demand_curve: from the (single) demand the experiment was run on.
     rate_by_label (planner.rate_by_label): needed only to draw the processing curve.
+    check: warns if the demand grid in hand is not the one the row was generated with.
     """
     blocks = parse_blocks(row["blocks"])
     D = np.asarray(D, dtype=np.float64)
-
+    if check:
+        cov = coverage_mask(blocks, labels, D.shape)
+        cov_ = float(D[cov].sum()) / float(D.sum())
+        if not (np.isclose(cov_, row["coverage"], atol=1e-9)
+                and np.isclose(float(D[cov].sum()), row["covered_demand"], atol=1e-6)):
+            print(f"WARNING: demand grid differs from the one used for this run "
+                  f"(recomputed coverage={cov_:.2%}, stored {row['coverage']:.2%}).")
     proc = (processing_from_blocks(blocks, rate_by_label, D.shape[1])
             if rate_by_label is not None else None)
-    plot_blocks(D, blocks, labels, time_values, row["alpha"], bin_minutes,
-                    metrics={"objective": row["objective"], "coverage": row["coverage"]},
-                    demand_curve=demand_curve, processing_curve=proc, show_second=show_second,
-                    title_prefix=f"rep {row['rep']}")
+    plot_blocks(D, blocks, labels, time_values, row["theta"], bin_minutes,
+                       metrics={"objective": row["objective"], "coverage": row["coverage"]},
+                       demand_curve=demand_curve, processing_curve=proc, show_second=show_second,
+                       title_prefix=f"rep {row['rep']}")
+
+def save_context(planner, path):
+    """
+    Save what is needed to plot any df_pert row later: demand grid, labels, time axis, bin length,
+    arrivals and processing rate of each server. Call it once, when the experiment is run.
+    """
+    np.savez(path,
+             D=np.asarray(planner.demand_grid, dtype=np.float64),
+             labels=np.array([str(l) for l in planner.server_labels]),
+             time_values=np.array([pd.Timestamp(t).isoformat() for t in planner.time_values]),
+             bin_minutes=float(planner.bin_minutes),
+             arrivals=planner.arrivals.to_numpy(dtype=np.float64),
+             rate_labels=np.array([str(k) for k in planner.rate_by_label]),
+             rate_values=np.array([float(v) for v in planner.rate_by_label.values()]))
+
+def load_context(path):
+    z = np.load(path, allow_pickle=False)
+    labels_all = [str(l) for l in z["labels"]]
+    return dict(
+        D=z["D"], labels=labels_all, time_values=pd.to_datetime(pd.Series(z["time_values"])),
+        bin_minutes=float(z["bin_minutes"]), arrivals=z["arrivals"],
+        rate_by_label=dict(zip([str(k) for k in z["rate_labels"]], z["rate_values"].tolist())))
+
+def plot_row(row, ctx, show_second=True, check=True):
+    """Plot a df_pert row (Series) using the context saved by save_context: no planner needed."""
+    labels = [l for l in ctx["labels"]][:ctx["D"].shape[0]]
+    return plot_run_from_row(row, ctx["D"], labels, ctx["time_values"], ctx["bin_minutes"],
+                             demand_curve=ctx["arrivals"], rate_by_label=ctx["rate_by_label"],
+                             show_second=show_second, check=check)
+
 
 # simulation results plotting
 def _step(ax, x, y, **kw):

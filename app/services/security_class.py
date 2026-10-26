@@ -44,7 +44,7 @@ class PlannerResults:
     # ---- parameters of the run ----
     L: float                                   # requested shift length, hours
     L_cells: int                               # shift length actually used, in bins
-    alpha: float                               # penalty per unit of idle capacity
+    theta: float                               # minimum utilization to open a window (0 <= theta < 1)
     K_total: int                               # shared budget of shifts
     bin_minutes: float                         # bin length, minutes
     # ---- inputs / outputs ----
@@ -53,11 +53,12 @@ class PlannerResults:
     server_schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]]   # label -> [(start, end), ...]
     df_curves: pd.DataFrame                    # one row per bin (see SecurityPlanner.run)
     coverage: float                            # total covered demand, from report.total.coverage
-
+ 
     # multi-length runs (empty for run())
     lengths: tuple = ()                        # allowed shift lengths, hours
     lengths_cells: tuple = ()                  # same, in bins
     length_totals: Optional[dict] = None       # {hours: max shifts across servers}
+    theta_rows: Optional[tuple] = None         # theta actually used on each row (server_labels order); None = theta everywhere
 
 class SecurityPlanner:
     """
@@ -86,13 +87,14 @@ class SecurityPlanner:
         self.results: PlannerResults | None = None
         self.report: CoverageReport | None = None
 
-    def run(self, L: float, alpha: float, K_total: int, exact: bool = False) -> PlannerResults:
+    def run(self, L: float, theta: float, K_total: int, exact: bool = False) -> PlannerResults:
         """
         L       : shift length in hours
-        alpha   : penalty per unit of idle capacity (objective = covered demand - alpha * idle)
+        theta   : minimum utilization to open a window, in [0, 1): a window is worth opening iff its mean load >= theta
+                  (objective = covered demand - theta * capacity)
         K_total : total number of shifts shared among the servers
         exact   : exact DP for the budget split instead of the greedy one
-
+ 
         results.df_curves has one row per bin with columns
             time        bin start
             demand      passengers arriving in the bin
@@ -101,15 +103,15 @@ class SecurityPlanner:
         """
         if L <= 0:
             raise ValueError("L must be > 0 (hours).")
-        if alpha < 0:
-            raise ValueError("alpha must be >= 0.")
+        if not 0 <= theta <= 1:
+            raise ValueError("theta must be in [0, 1].")
         if int(K_total) != K_total or K_total < 0:
             raise ValueError("K_total must be an integer >= 0.")
         K_total = int(K_total)
-
+ 
         bin_hours = self.bin_minutes / 60.0
         L_cells = max(1, math.floor(L / bin_hours + 0.5))
-
+ 
         # only as many counter rows as there are servers to staff them
         n_rows = self.demand_grid.shape[0]
         n_usable = min(n_rows, len(self.server_labels))
@@ -117,21 +119,20 @@ class SecurityPlanner:
             logger.warning(f"[SecurityPlanner] demand needs up to {n_rows} servers but the registry has {n_usable}")
         grid = self.demand_grid[:n_usable]
         labels = self.server_labels[:n_usable]
-
+ 
         # ---- optimization ----
-        logger.info(f"[SecurityPlanner] Launching allocation DP: L={L:.2f}h, alpha={alpha:.2f}")
+        logger.info(f"[SecurityPlanner] Launching allocation DP: L={L:.2f}h, theta={theta:.2f}")
         # 1) For each row compute the best achievable value for every number of shifts k = 0..K
-        curve = solve_coverage_batch(grid, L_cells, alpha)
+        curve = solve_coverage_batch(grid, L_cells, theta)
         # 2) Split the shared budget K_total among the rows by maximising the sum of their curves
         # (greedy: optimal only if the curves are concave; exact=True uses a DP over rows x budget).
         alloc = allocate_budget(curve, K_total, exact=exact)
         # 3) Re-solve each row with its own number of shifts k to recover the actual start times.
-        sols = solve_allocated(grid, L_cells, alpha, alloc)
-
+        sols = solve_allocated(grid, L_cells, theta, alloc)
+ 
         # get coverage report
         row_labels = list(self.server_labels[:n_usable]) + ["no server"] * (n_rows - n_usable)
-        self.report = coverage_report(self.demand_grid, sols, L_cells, self.time_values, row_labels, alpha)
-
+        self.report = coverage_report(D=self.demand_grid, sols=sols, L=L_cells, time_values=self.time_values, theta=theta, row_labels=row_labels)
         # server schedule: row c is staffed by the c-th server in priority order
         schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]] = {}
         for label, sol in zip(labels, sols):
@@ -144,7 +145,7 @@ class SecurityPlanner:
                 )
                 for s0 in sorted(sol.starts)
             ]
-
+ 
         # curves, for plotting: demand, processing, servers open
         extra = L_cells - 1
         time_ext = self.time_values
@@ -161,46 +162,51 @@ class SecurityPlanner:
                 dtype=object,
             ),
         })
-
+ 
         # output results
         self.results = PlannerResults(
             L=L,
             L_cells=L_cells,
-            alpha=alpha,
+            theta=theta,
             K_total=K_total,
             bin_minutes=self.bin_minutes,
             demand_grid=self.demand_grid,
             server_labels=tuple(labels),
             server_schedule=schedule,
             df_curves=df_curves,
-            coverage=self.report.total.coverage
+            coverage=self.report.total.coverage,
+            theta_rows=tuple(float(theta) for _ in labels),
         )
         return self.results
-
-    def run_multi(self, lengths: Sequence[float], alpha: float, K_total: int,
-                  length_totals: Optional[dict] = None, alpha_first: Optional[float] = None) -> PlannerResults:
+ 
+    def run_multi(self, lengths: Sequence[float], theta: float, K_total: int,
+                  length_totals: Optional[dict] = None, theta_first: Optional[float] = None) -> PlannerResults:
         """
         lengths       : allowed shift lengths in hours, e.g. [2, 3]
-        alpha         : penalty per unit of idle capacity
+        theta         : minimum utilization to open a window, in [0, 1)
         K_total       : total number of shifts (of any length) shared among the servers
         length_totals : {hours: max shifts of that length across all servers}
+        theta_first   : theta of the first row (first server in priority order) if different from `theta`;
+                        theta_first=0 keeps that server on for as long as the budget allows
         """
         lengths_h = sorted({float(l) for l in lengths})
         if not lengths_h or lengths_h[0] <= 0:
             raise ValueError("lengths must be a non-empty list of positive durations (hours).")
-        if alpha < 0:
-            raise ValueError("alpha must be >= 0.")
+        if not 0 <= theta <= 1:
+            raise ValueError("theta must be in [0, 1].")
+        if theta_first is not None and not 0 <= theta_first <= 1:
+            raise ValueError("theta_first must be in [0, 1].")
         if int(K_total) != K_total or K_total < 0:
             raise ValueError("K_total must be an integer >= 0.")
         K_total = int(K_total)
-
+ 
         bin_hours = self.bin_minutes / 60.0
         cells_of = {h: max(1, math.floor(h / bin_hours + 0.5)) for h in lengths_h}
         lengths_cells = [cells_of[h] for h in lengths_h]
         if len(set(lengths_cells)) < len(lengths_cells):
             raise ValueError(f"lengths {lengths_h} h collapse onto the same number of bins ({lengths_cells}) "
                              f"with {self.bin_minutes:g}-minute bins.")
-
+ 
         def to_cells(d: Optional[dict], name: str) -> Optional[dict]:
             if d is None:
                 return None
@@ -208,9 +214,9 @@ class SecurityPlanner:
             if not keys <= set(lengths_h):
                 raise ValueError(f"{name} has lengths {sorted(keys - set(lengths_h))} not in lengths={lengths_h}")
             return {cells_of[float(h)]: int(v) for h, v in d.items()}
-
+ 
         totals_cells = to_cells(length_totals, "length_totals")
-
+ 
         # only as many counter rows as there are servers to staff them
         n_rows = self.demand_grid.shape[0]
         n_usable = min(n_rows, len(self.server_labels))
@@ -218,34 +224,35 @@ class SecurityPlanner:
             logger.warning(f"[SecurityPlanner] demand needs up to {n_rows} servers but the registry has {n_usable}")
         grid = self.demand_grid[:n_usable]
         labels = self.server_labels[:n_usable]
-
-        alpha_rows = np.full(n_usable, float(alpha))
-
-        if alpha_first is not None:
-            alpha_rows[0] = float(alpha_first)
-   
+ 
+        theta_rows = np.full(n_usable, float(theta))
+ 
+        if theta_first is not None:
+            theta_rows[0] = float(theta_first)
+ 
         # ---- optimization ----
-        logger.info(f"[SecurityPlanner] Launching multi-length allocation: lengths={lengths_h} h, alpha={alpha:.2f}")
-        curves = solve_coverage_batch_multi(grid, lengths_cells, alpha_rows, allow_overhang=False)
+        logger.info(f"[SecurityPlanner] Launching multi-length allocation: lengths={lengths_h} h, theta={theta:.2f}")
+        curves = solve_coverage_batch_multi(grid, lengths_cells, theta_rows, allow_overhang=False)
         alloc = allocate_milp(curves, lengths_cells, K_total=K_total, length_per_day=totals_cells)
-        sols = solve_allocated_multi(grid, alpha_rows, alloc, allow_overhang=False)
-
+        sols = solve_allocated_multi(grid, theta_rows, alloc, allow_overhang=False)
+ 
         row_labels = list(labels) + ["no server"] * (n_rows - n_usable)
-        alpha_report = np.append(alpha_rows, np.full(n_rows - n_usable, float(alpha)))
-
-        self.report = coverage_report_multi(self.demand_grid, sols, self.time_values, row_labels, alpha_report)
+        theta_report = np.append(theta_rows, np.full(n_rows - n_usable, float(theta)))
+ 
+        self.report = coverage_report_multi(D=self.demand_grid, sols=sols, time_values=self.time_values, row_labels=row_labels, theta=theta_report)
         schedule, df_curves = self._schedule_and_curves(sols, labels)
-
+ 
         self.results = PlannerResults(
             L=lengths_h[-1], L_cells=lengths_cells[-1],
-            alpha=alpha, K_total=K_total, bin_minutes=self.bin_minutes,
+            theta=theta, K_total=K_total, bin_minutes=self.bin_minutes,
             demand_grid=self.demand_grid, server_labels=tuple(labels),
             server_schedule=schedule, df_curves=df_curves,
             coverage=self.report.total.coverage,
             lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), length_totals=length_totals,
+            theta_rows=tuple(float(t) for t in theta_rows),
         )
         return self.results
-
+ 
     def _schedule_and_curves(self, sols, labels):
         """Schedule {label: [(start, end), ...]} and df_curves, from solutions with a length per block."""
         schedule = {}
@@ -258,7 +265,7 @@ class SecurityPlanner:
                  (self.time_values[int(s)] + int(l) * self.bin_duration).to_pydatetime())
                 for s, l in zip(sol.starts[order], sol.lengths[order])
             ]
-
+ 
         active = np.vstack([s.coverage for s in sols])
         rates = np.array([self.rate_by_label[label] for label in labels])
         df_curves = pd.DataFrame({
@@ -284,7 +291,7 @@ class MultiDayResults:
     # ---- parameters of the run ----
     lengths: tuple                      # allowed shift lengths, hours
     lengths_cells: tuple                # shift lengths in bins
-    alpha: float
+    theta: float
     K_total: Optional[int]
     length_per_day: Optional[dict]       # {length in hours: cap}
     K_day: Optional[dict]               # {day index: cap}
@@ -371,14 +378,14 @@ class MultiDayPlanner:
     def run(
         self,
         lengths: Sequence[float],
-        alpha: float,
+        theta: float,
         K_total: Optional[int] = None,
         length_per_day: Optional[dict] = None,
         K_day: Optional[Union[int, dict, Sequence[int]]] = None,
     ) -> MultiDayResults:
         """
         lengths       : allowed shift lengths, hours
-        alpha         : penalty per unit of idle capacity (objective = covered demand - alpha * idle)
+        theta         : minimum utilization to open a window, in [0, 1) (objective = covered demand - theta * capacity)
         K_total       : max number of shifts over all days and servers (None = no limit)
         length_per_day : {length in hours: max number of shifts of that length on each day}
         K_day         : max number of shifts per day: an int (all days), a sequence with one value per day,
@@ -388,8 +395,8 @@ class MultiDayPlanner:
         lengths_h = sorted({float(l) for l in lengths})
         if not lengths_h or lengths_h[0] <= 0:
             raise ValueError("lengths must be a non-empty list of positive durations (hours).")
-        if alpha < 0:
-            raise ValueError("alpha must be >= 0.")
+        if not 0 <= theta <= 1:
+            raise ValueError("theta must be in [0, 1].")
         if K_total is not None and (int(K_total) != K_total or K_total < 0):
             raise ValueError("K_total must be an integer >= 0.")
  
@@ -416,9 +423,9 @@ class MultiDayPlanner:
         grid = self.demand_grid[:, :n_use, :]                       # (N, n_use, T)
  
         # 1) value curves, day by day
-        logger.info(f"[MultiDayPlanner] curves: {N} days x {n_use} layers, lengths={lengths_h} h, alpha={alpha:.2f}")
+        logger.info(f"[MultiDayPlanner] curves: {N} days x {n_use} layers, lengths={lengths_h} h, theta={theta:.2f}")
         day_curves = [
-            solve_coverage_batch_multi(grid[n], lengths_cells, alpha, allow_overhang=False)
+            solve_coverage_batch_multi(grid[n], lengths_cells, theta, allow_overhang=False)
             for n in range(N)
         ]
         shape = tuple(np.max([c.shape[1:] for c in day_curves], axis=0))
@@ -435,11 +442,11 @@ class MultiDayPlanner:
             sl = slice(n * n_use, (n + 1) * n_use)
             sub = MultiAllocation(k=alloc.k[sl], lengths=alloc.lengths,
                                   value=float(alloc.per_row_value[sl].sum()), per_row_value=alloc.per_row_value[sl])
-            sols = solve_allocated_multi(grid[n], alpha, sub, allow_overhang=False)
+            sols = solve_allocated_multi(grid[n], theta, sub, allow_overhang=False)
  
             tv = self.time_values_by_day[n]
             row_labels = labels + ["no server"] * (R - n_use)
-            rep = coverage_report_multi(self.demand_grid[n], sols, tv, row_labels, alpha)
+            rep = coverage_report_multi(D=self.demand_grid[n], sols=sols, time_values=tv, row_labels=row_labels, theta=theta)
             reports.append(rep)
  
             sched_n, df_n = self._schedule_and_curves(sols, labels, tv, self.A[n])
@@ -448,13 +455,13 @@ class MultiDayPlanner:
                 schedule.setdefault(label, []).extend(windows)
  
             day_results.append(self._day_result(
-                n, lengths_h, lengths_cells, alpha, K_total, length_per_day, labels, sched_n, df_n, rep))
+                n, lengths_h, lengths_cells, theta, K_total, length_per_day, labels, sched_n, df_n, rep))
  
         schedule = {label: sorted(w) for label, w in schedule.items()}
         self.reports = reports
         self.report = self._merge_reports(reports)
         self.results = MultiDayResults(
-            lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), alpha=alpha,
+            lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), theta=theta,
             K_total=None if K_total is None else int(K_total), 
             length_per_day=length_per_day, 
             K_day=day_caps,
@@ -465,8 +472,7 @@ class MultiDayPlanner:
             allocation=alloc, 
             day_results=tuple(day_results))
         return self.results
-
-    # ------------------------------------------------------------------ #
+ 
     def shifts_per_day(self) -> pd.DataFrame:
         """Number of shifts of each length opened on each day (from the schedule actually built)."""
         if self.results is None:
@@ -495,7 +501,6 @@ class MultiDayPlanner:
         df[counts] = df[counts].astype(int)
         return df
  
-    # ------------------------------------------------------------------ #
     def _day_caps(self, K_day) -> Optional[dict]:
         """K_day -> {day index: cap}."""
         N = len(self.days)
@@ -550,13 +555,14 @@ class MultiDayPlanner:
         })
         return schedule, df
  
-    def _day_result(self, n, lengths_h, lengths_cells, alpha, K_total, length_per_day, labels, sched, df, rep):
+    def _day_result(self, n, lengths_h, lengths_cells, theta, K_total, length_per_day, labels, sched, df, rep):
         """Single-day PlannerResults, so that plotutils.plot_allocation(day_result) works as for SecurityPlanner."""
         values = dict(
-            L=lengths_h[-1], L_cells=lengths_cells[-1], alpha=alpha, K_total=K_total, bin_minutes=self.bin_minutes,
+            L=lengths_h[-1], L_cells=lengths_cells[-1], theta=theta, K_total=K_total, bin_minutes=self.bin_minutes,
             demand_grid=self.demand_grid[n], server_labels=tuple(labels), server_schedule=sched,
             df_curves=df, coverage=float(rep.total.coverage),
             lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells),
+            theta_rows=tuple(float(theta) for _ in labels),
         )
         fields = {f.name for f in dataclasses.fields(PlannerResults)}
         return PlannerResults(**{k: v for k, v in values.items() if k in fields})
@@ -590,9 +596,6 @@ def _regular_step(index: pd.DatetimeIndex) -> pd.Timedelta:
     if not (steps == steps[0]).all():
         raise ValueError("the time index of arrivals must be regular (constant bin length).")
     return pd.Timedelta(steps[0])
-
-
-
 
 
 

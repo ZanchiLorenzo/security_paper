@@ -22,8 +22,7 @@ Optional iterated local search: random kicks followed by a new descent, keep onl
 import numpy as np
 import pandas as pd
  
- 
-# ------------------------------------------------------------------ fluid queue
+# fluid queue
 def capacity_per_slot(blocks, rates, T):
     """pax/bin the open lanes can process in each slot (rates: {label: pax per bin})."""
     cap = np.zeros(T)
@@ -77,21 +76,24 @@ def fluid_diagnostics(arrivals, rates, blocks, bin_minutes, refine=15):
     S = np.concatenate([[0.0], np.cumsum(a - c)])
     Q = (S - np.minimum.accumulate(S))[refine::refine]
     return pd.DataFrame(dict(arrivals=a_slot, capacity=cap, queue_end=Q))
- 
-# ------------------------------------------------------------------ evaluation of a schedule
-def evaluate(blocks, arrivals, rates, D, labels, alpha, bin_minutes):
+
+# evaluation of a schedule
+def evaluate(blocks, arrivals, rates, D, labels, theta, bin_minutes):
+    """theta: number, or one value per row of D (same order as labels), e.g. res.theta_rows."""
     row_of = {l: c for c, l in enumerate(labels)}
-    covered = idle = 0.0
+    theta_rows = np.broadcast_to(np.asarray(theta, dtype=np.float64), (np.shape(D)[0],))
+    covered = idle = objective = 0.0
     for label, bl in blocks.items():
         for s, l in bl:
             seg = D[row_of[label], s:s + l]
-            covered += float(seg.sum()); idle += float((1.0 - seg).sum())
+            c = float(seg.sum())
+            covered += c; idle += float((1.0 - seg).sum())
+            objective += c - theta_rows[row_of[label]] * l
     wait, unserved = fluid_metrics(arrivals, rates, blocks, bin_minutes)
     return dict(q_fluid=wait, unserved_fluid=unserved, covered_demand=covered, idle_capacity=idle,
-                coverage=covered / float(D.sum()), objective=covered - alpha * idle)
+                coverage=covered / float(D.sum()), objective=objective)
  
- 
-# ------------------------------------------------------------------ neighbourhood
+# neighbourhood
 def _fits(lane_blocks, s, l, T):
     """The window [s, s+l) lies in [0, T] and does not overlap the (start, length) blocks of the lane."""
     if s < 0 or s + l > T:
@@ -121,8 +123,8 @@ def _apply(blocks, move, l):
     new[label].sort()
     return new
  
-# ------------------------------------------------------------------ local search
-def local_search(arrivals, rates, D, labels, alpha, blocks0, bin_minutes,
+# local search
+def local_search(arrivals, rates, D, labels, theta, blocks0, bin_minutes,
                  penalty=None, j_tol=1e-6,
                  unserved_tol=0.5, wait_tol=1e-6, max_iter=500, max_shift=None,
                  n_kicks=0, kick_size=3, seed=0, refine=15, verbose=True):
@@ -137,6 +139,8 @@ def local_search(arrivals, rates, D, labels, alpha, blocks0, bin_minutes,
         unserved_tol : pax. A move that lowers the unserved by more than this is an "unserved move"; the others must
                        keep unserved <= best unserved so far + unserved_tol and lower the wait by more than wait_tol.
  
+    theta     : only tracked (objective = covered - theta * capacity in the trace): a number or one value per row of D
+                (use res.theta_rows to keep the first-row theta). It does not drive the search.
     max_shift : None = a block can jump anywhere in the day (in its own lane); int = at most that many slots away.
     n_kicks   : iterated local search: after the descent, `n_kicks` times apply `kick_size` random relocations
                 to the best schedule, descend again, keep the result only if it is better under the criterion.
@@ -152,7 +156,7 @@ def local_search(arrivals, rates, D, labels, alpha, blocks0, bin_minutes,
     rng = np.random.default_rng(seed)
  
     def row(blocks, it, kick, move):
-        m = evaluate(blocks, a_slot, rates, D, labels, alpha, bin_minutes)
+        m = evaluate(blocks, a_slot, rates, D, labels, theta, bin_minutes)
         if Jf is not None:
             m["J"] = Jf(m["q_fluid"], m["unserved_fluid"])
         return dict(iter=it, kick=kick, move=move, **m)

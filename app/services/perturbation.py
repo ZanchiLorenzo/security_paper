@@ -13,7 +13,7 @@ def schedule_to_blocks(planner, res) -> dict:
             for s, e in windows
         )
     return out
-
+ 
 def blocks_to_schedule(planner, blocks: dict) -> dict:
     """{label: [(start_slot, length_slots), ...]} -> {label: [(start_dt, end_dt), ...]}, same format as res.server_schedule."""
     t0, step = pd.Timestamp(planner.time_values[0]), planner.bin_duration
@@ -22,15 +22,15 @@ def blocks_to_schedule(planner, blocks: dict) -> dict:
                 for s, l in bl]
         for label, bl in blocks.items() if len(bl)
     }
-
+ 
 def blocks_to_json(blocks: dict) -> str:
     return json.dumps({k: [[int(s), int(l)] for s, l in v] for k, v in blocks.items()})
-
+ 
 def parse_blocks(x) -> dict:
     """Inverse of blocks_to_json (also accepts an already parsed dict). Safe to store in xlsx/csv."""
     d = x if isinstance(x, dict) else json.loads(x)
     return {k: [(int(s), int(l)) for s, l in v] for k, v in d.items()}
-
+ 
 # coverage of a schedule
 def coverage_from_blocks(planner, res, blocks: dict) -> dict:
     """
@@ -38,23 +38,30 @@ def coverage_from_blocks(planner, res, blocks: dict) -> dict:
     Layer r of the demand grid is operated by res.server_labels[r].
     coverage = covered demand / total demand (dropped layers included in the denominator);
     idle capacity counts the slots of a block that overhang the horizon (zero demand).
+    objective = sum over rows of (covered_r - theta_r * capacity_r), with theta_r = res.theta_rows[r]
+    (res.theta on every row if the result has no per-row values).
     """
     D = planner.demand_grid
+    labels = list(res.server_labels)
+    theta_rows = getattr(res, "theta_rows", None)
+    theta_rows = np.full(len(labels), float(res.theta)) if theta_rows is None else np.asarray(theta_rows, dtype=float)
     pad = max((l for bl in blocks.values() for _, l in bl), default=1) - 1
     Dp = np.pad(D, ((0, 0), (0, pad)))
-    covered = idle = 0.0
-    for r, label in enumerate(res.server_labels):
+    covered = idle = objective = 0.0
+    for r, label in enumerate(labels):
         for s, l in blocks.get(label, []):
             seg = Dp[r, s:s + l]
-            covered += float(seg.sum())
-            idle += float((1.0 - seg).sum())
+            c = float(seg.sum())
+            covered += c
+            idle += float(l) - c
+            objective += c - theta_rows[r] * l
     return dict(
         covered_demand=covered,
         idle_capacity=idle,
         coverage=covered / float(D.sum()),
-        objective=covered - res.alpha * idle,
+        objective=objective,
     )
-
+ 
 def res_with_blocks(planner, res, blocks: dict):
     """
     Copy of the planner result in which the schedule is replaced by `blocks`, so that any plot that
@@ -78,18 +85,18 @@ def res_with_blocks(planner, res, blocks: dict):
         df_curves=df,
         coverage=coverage_from_blocks(planner, res, blocks)["coverage"],
     )
-
+ 
 # random movement of some block
 def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator, step: int = 1):
     """
     Move n_moves randomly chosen blocks (any lane), each by exactly `step` slots (default 1), to the left or
     to the right with equal probability. Lengths and lane assignment never change.
-
+ 
     The result is always feasible: a block stays between its neighbours in the same lane (adjacent blocks
     are allowed; neighbours already moved count with their new position) and ends by slot T
     (no overhang, as in the allocator). A block that cannot move in any direction is skipped
     and another one is drawn.
-
+ 
     Returns (new_blocks, moves): moves = [(label, block index, shift), ...] actually applied;
     len(moves) < n_moves only if too few blocks could move.
     """
@@ -112,60 +119,70 @@ def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator,
         moves.append((label, i, d))
     return new, moves
 
-# what changed between two schedules of df_pert
-_METRICS = ["coverage", "objective", "qtime_mean", "n_unserved"]
+_EDIT_KEYS = {"lane", "block", "shift", "length", "remove"}
 
-def _pick_row(df_pert: pd.DataFrame, x) -> pd.Series:
-    """x = value of the 'rep' column, or directly a row (pd.Series) of df_pert."""
-    return x if isinstance(x, pd.Series) else df_pert.loc[df_pert["rep"] == x].iloc[0]
-
-def diff_schedules(df_pert: pd.DataFrame, rep_a, rep_b, planner=None, verbose: bool = True) -> pd.DataFrame:
+def edit_blocks(blocks, labels, edits, T, add=None):
     """
-    Compare the schedules of two rows of df_pert (a = reference, e.g. the baseline rep=0; b = the other one).
+    Modifica a mano una schedule {label: [(start_slot, length_slots), ...]}.
 
-    Returns one row per block that differs:
-      kind = 'moved'   same lane, same length, different start (shift = start_b - start_a, in slots)
-             'removed' block only in a
-             'added'   block only in b
-    Blocks are matched by their position in the lane, which is exact when blocks are only shifted (same
-    number of blocks and same lengths per lane); otherwise the lane is compared as a set of (start, length).
-    With `planner`, start/end times of both schedules are added.
-    Prints the change of coverage / objective / queue KPIs between the two rows when verbose.
+    edits : lista di dict, uno per blocco da cambiare
+              lane   : etichetta ('3') oppure posizione 0-based in `labels`
+              block  : indice 0-based del blocco nella lane (ordinato per start; riferito alla baseline)
+              shift  : slot di spostamento (+ = piu' tardi), default 0
+              length : nuova lunghezza in slot (opzionale), lo start resta quello dopo lo shift
+              remove : True per eliminare il blocco
+    add   : lista di dict(lane=..., start=..., length=...) con nuovi blocchi (slot, 0-based)
+    T     : numero di slot del giorno; ogni blocco deve stare in [0, T] e non sovrapporsi nella lane.
+    Ritorna (new_blocks, log). Solleva ValueError se una modifica non e' valida.
     """
-    ra, rb = _pick_row(df_pert, rep_a), _pick_row(df_pert, rep_b)
-    A, B = parse_blocks(ra["blocks"]), parse_blocks(rb["blocks"])
-    labels = list(A) + [k for k in B if k not in A]
+    labels = list(labels)
 
-    recs = []
-    for label in labels:
-        a, b = A.get(label, []), B.get(label, [])
-        if len(a) == len(b) and all(la == lb for (_, la), (_, lb) in zip(a, b)):
-            for i, ((sa, l), (sb, _)) in enumerate(zip(a, b)):
-                if sa != sb:
-                    recs.append(dict(lane=label, block=i, kind="moved", length=l,
-                                     start_a=sa, start_b=sb, shift=sb - sa))
-        else:
-            for s, l in sorted(set(a) - set(b)):
-                recs.append(dict(lane=label, block=a.index((s, l)), kind="removed", length=l,
-                                 start_a=s, start_b=None, shift=None))
-            for s, l in sorted(set(b) - set(a)):
-                recs.append(dict(lane=label, block=b.index((s, l)), kind="added", length=l,
-                                 start_a=None, start_b=s, shift=None))
-    diff = pd.DataFrame(recs, columns=["lane", "block", "kind", "length", "start_a", "start_b", "shift"])
+    def lane_of(x):
+        if isinstance(x, str):
+            if x not in labels and x not in blocks:
+                raise ValueError(f"unknown lane {x!r}; lanes are {labels}")
+            return x
+        i = int(x)
+        if not 0 <= i < len(labels):
+            raise ValueError(f"lane index {i} out of range 0..{len(labels) - 1} ({labels})")
+        return labels[i]
 
-    if planner is not None and len(diff):
-        t0, step = pd.Timestamp(planner.time_values[0]), planner.bin_duration
-        hhmm = lambda s: None if pd.isna(s) else (t0 + int(s) * step).strftime("%H:%M")
-        for side in ("a", "b"):
-            diff[f"time_{side}"] = [
-                None if pd.isna(s) else f"{hhmm(s)}-{hhmm(s + l)}"
-                for s, l in zip(diff[f"start_{side}"], diff["length"])]
+    cur = {k: [[int(s), int(l)] for s, l in v] for k, v in blocks.items()}
+    log, touched = [], set()
+    for e in edits or []:
+        bad = set(e) - _EDIT_KEYS
+        if bad:
+            raise ValueError(f"unknown keys {sorted(bad)} in edit {e}; allowed: {sorted(_EDIT_KEYS)}")
+        lab, i = lane_of(e["lane"]), int(e["block"])
+        n = len(cur.get(lab, []))
+        if not 0 <= i < n:
+            raise ValueError(f"lane {lab!r} has {n} blocks (0..{n - 1}); block={i}")
+        if (lab, i) in touched:
+            raise ValueError(f"block {i} of lane {lab!r} is edited twice")
+        touched.add((lab, i))
+        if e.get("remove"):
+            log.append(f"{lab} block {i}: removed {tuple(cur[lab][i])}")
+            cur[lab][i] = None
+            continue
+        s, l = cur[lab][i]
+        shift, new_len = int(e.get("shift", 0)), e.get("length")
+        s2, l2 = s + shift, (l if new_len is None else int(new_len))
+        cur[lab][i] = [s2, l2]
+        log.append(f"{lab} block {i}: ({s},{l}) -> ({s2},{l2})")
+    for a in add or []:
+        lab = lane_of(a["lane"])
+        cur.setdefault(lab, []).append([int(a["start"]), int(a["length"])])
+        log.append(f"{lab}: added ({int(a['start'])},{int(a['length'])})")
 
-    if verbose:
-        print(f"rep {ra['rep']} (a)  vs  rep {rb['rep']} (b): "
-              f"{(diff.kind == 'moved').sum()} moved, {(diff.kind == 'removed').sum()} removed, "
-              f"{(diff.kind == 'added').sum()} added")
-        kp = pd.DataFrame(
-            {m: dict(a=ra[m], b=rb[m], delta=rb[m] - ra[m]) for m in _METRICS if m in ra.index}).T
-        print(kp.round(4).to_string())
-    return diff
+    out = {}
+    for lab, bl in cur.items():
+        bl = sorted(tuple(b) for b in bl if b is not None)
+        for s, l in bl:
+            if l < 1 or s < 0 or s + l > T:
+                raise ValueError(f"lane {lab!r}: block (start={s}, length={l}) is outside the day [0, {T}]")
+        for (s1, l1), (s2, l2) in zip(bl, bl[1:]):
+            if s2 < s1 + l1:
+                raise ValueError(f"lane {lab!r}: blocks (start={s1}, length={l1}) and (start={s2}, length={l2}) overlap")
+        if bl:
+            out[lab] = bl
+    return out, log
