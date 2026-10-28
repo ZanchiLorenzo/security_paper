@@ -15,16 +15,20 @@ Model (per day n, slots t = 0..T-1, dt = bin length in minutes, a_t = arrivals, 
     sum_{l, s covering t} x[r,l,s] <= 1                                     windows of a lane do not overlap
     c_t   = sum_r mu_r * sum_{l, s covering t} x[r,l,s]                      capacity of slot t (pax)
     Q_t  >= Q_{t-1} + a_t - c_t,  Q_t >= 0,  Q_{-1} = 0                      fluid queue at the end of slot t
-    min   dt * sum_t (Q_{t-1} + Q_t)/2  +  P * Q_{T-1}                       waiting area + P minutes per unserved pax
+Objective, LEXICOGRAPHIC and without any weight (two solves, same constraints):
+    stage 1   min  U = sum_n Q_{n,T-1}                                       fewest unserved passengers
+    stage 2   min  dt * sum_t (Q_{t-1} + Q_t)/2   s.t.  U <= U* + unserved_tol   then the smallest total waiting time
 Since a_t and c_t are uniform inside a slot, Q_t = max(0, Q_{t-1} + a_t - c_t) is exact at slot boundaries (it is the same
 queue as local_search._fluid_from_cap); the area under Q is the trapezoid of the two end values (exact when the queue
 does not empty inside the slot, a slight over-estimate otherwise). Q_{T-1} is the mass that never departs: the "unserved".
-The objective / N is a mean wait per passenger in which unserved passengers wait until the end of the horizon
-(censored) plus P: close to, but not identical with, the J of local_search (served-only wait + P * unserved / N).
+The stage-2 objective / N is the mean wait per passenger, unserved ones waiting until the end of the horizon (censored).
+When U* = 0 it is exactly the mean wait of local_search.fluid_metrics; when U* > 0 the two differ slightly (that one
+averages over the served mass only).
 """
 import dataclasses
 import logging
 import math
+import time
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -33,8 +37,8 @@ import pyomo.environ as pyo
 from app.services.coverage_dp import MultiSolution, MultiAllocation, coverage_report_multi, _normalize_lengths
 
 # helpers
-def fluid_cost(arrivals, capacity, bin_minutes, penalty):
-    """Objective of the MILP evaluated on a given capacity profile (pax/slot): (cost, wait_area, unserved)."""
+def fluid_cost(arrivals, capacity, bin_minutes):
+    """Fluid queue on a given capacity profile (pax/slot): (wait_area in pax*min, unserved pax at the end)."""
     a = np.asarray(arrivals, dtype=np.float64)
     c = np.asarray(capacity, dtype=np.float64)
     q_prev, area = 0.0, 0.0
@@ -42,7 +46,7 @@ def fluid_cost(arrivals, capacity, bin_minutes, penalty):
         q = max(0.0, q_prev + at - ct)
         area += bin_minutes * 0.5 * (q_prev + q)
         q_prev = q
-    return area + penalty * q_prev, area, q_prev
+    return area, q_prev
 
 def allocation_from_solutions(sols, lengths, values=None) -> MultiAllocation:
     """MultiAllocation (k per row and length) of a list of MultiSolution, like the one allocate_milp returns."""
@@ -54,6 +58,34 @@ def allocation_from_solutions(sols, lengths, values=None) -> MultiAllocation:
     per_row = np.array([s.value for s in sols], dtype=float) if values is None else np.asarray(values, dtype=float)
     return MultiAllocation(k=k, lengths=lengths, value=float(per_row.sum()), per_row_value=per_row)
 
+def pack_to_lowest_lanes(wins_by_lane: dict, mu) -> dict:
+    """
+    Reassign the windows of one day to the lowest-index lanes, without changing the capacity profile.
+    wins_by_lane {r: [(start, length), ...]}; mu rate of each lane. Only lanes with the same rate are interchangeable, so
+    the windows are packed within each group of equal-rate lanes: sorted by start, each window goes to the lowest lane that
+    is free at its start (first fit: uses the smallest possible number of lanes of the group, = the maximum overlap).
+    """
+    R = len(mu)
+    groups = []
+    for r in range(R):
+        for g in groups:
+            if np.isclose(mu[r], mu[g[0]]):
+                g.append(r)
+                break
+        else:
+            groups.append([r])
+    out = {r: [] for r in range(R)}
+    for g in groups:
+        wins = sorted((s, l) for r in g for (s, l) in wins_by_lane.get(r, []))
+        wins.sort(key=lambda w: (w[0], -w[1]))
+        end = {r: -1 for r in g}
+        for s, l in wins:
+            r = next(r for r in g if end[r] <= s)
+            out[r].append((s, l))
+            end[r] = s + l
+    return out
+
+
 # MILP
 def solve_fluid_milp(
     arrivals: np.ndarray,
@@ -64,10 +96,12 @@ def solve_fluid_milp(
     K_total: Optional[int] = None,
     length_per_day: Optional[dict] = None,
     K_day: Optional[Union[int, dict, Sequence[int]]] = None,
-    penalty: float = 30.0,
+    unserved_tol: float = 1e-3,
     demand: Optional[np.ndarray] = None,
     window_cost: float = 1e-6,
     symmetry_breaking: bool = True,
+    pack_lanes: bool = True,
+    prefix_lanes: bool = False,
     time_limit: Optional[float] = None,
     mip_gap: float = 0.0,
     return_info: bool = False,
@@ -82,15 +116,23 @@ def solve_fluid_milp(
     K_total        : max number of windows over all lanes and days (None = no limit)
     length_per_day : {length in bins: max windows of that length on each day}   (as in allocate_milp)
     K_day          : max windows per day: int, dict {n: cap} or sequence (as in allocate_milp)
-    penalty        : P, minutes charged to every passenger still in the queue at the end of the day
+    unserved_tol   : pax. Stage 2 may leave up to U* + unserved_tol unserved (U* = minimum found by stage 1); the
+                     default makes the order strictly lexicographic. No penalty weight: nothing to tune.
     demand         : optional demand grid (R, T) or (N, R, T), R >= number of lanes: only to fill the stats of the solutions
                      (sol.inside / outside / missed) and sol.value (= covered load)
     window_cost    : tiny cost per window so that useless windows (no effect on the queue) are not opened
     symmetry_breaking : lanes with the same rate are interchangeable: order them by opened slots (valid, speeds up the MILP)
-    time_limit     : seconds (None = run to optimality); mip_gap : relative gap (0 = exact)
+    pack_lanes     : after solving, reassign the windows to the lowest-index lanes (first fit within each group of equal-rate
+                     lanes). The capacity profile, hence queue and unserved, does not change; only which lane hosts which window.
+    prefix_lanes   : constraint inside the MILP: lane r can be open in a slot only if lane r-1 is (open lanes always form a
+                     prefix of the priority order; then layer coverage = true coverage). It RESTRICTS the schedules (windows
+                     have fixed lengths and cannot be split between lanes), so the queue can get worse: off by default.
+    time_limit     : seconds in total (None = run to optimality): up to 25% for stage 1, the rest for stage 2;
+                     mip_gap : relative gap of stage 2 (0 = exact)
 
     Returns sols (list of MultiSolution, row = n * R + r, R = len(labels)); with return_info=True also a dict with
-    objective, objective per passenger, lower bound and relative gap proved by the solver, status and the queue metrics.
+    unserved (stage 1 minimum, as found) and its status / lower bound, wait_area, mean wait per pax (wait_mean),
+    lower bound and relative gap of stage 2, status, n_windows.
     """
     A = np.asarray(arrivals, dtype=np.float64)
     if A.ndim == 1:
@@ -140,6 +182,14 @@ def solve_fluid_milp(
             cap = sum(float(mu[r]) * open_expr(n, r, t) for r in range(R))
             m.queue.add(m.Q[n, t] >= prev + float(A[n, t]) - cap)
 
+    # open lanes form a prefix of the priority order
+    if prefix_lanes:
+        m.prefix = pyo.ConstraintList()
+        for n in range(N):
+            for r in range(1, R):
+                for t in range(T):
+                    m.prefix.add(open_expr(n, r, t) <= open_expr(n, r - 1, t))
+
     # budgets (same semantics as allocate_milp)
     def count(n=None, l=None):
         return sum(m.x[nn, r, ll, s] for (nn, r, ll, s) in idx
@@ -171,24 +221,39 @@ def solve_fluid_milp(
 
     wait_area = sum(dt * 0.5 * ((m.Q[n, t - 1] if t > 0 else 0.0) + m.Q[n, t]) for n in range(N) for t in range(T))
     unserved = sum(m.Q[n, T - 1] for n in range(N))
-    m.obj = pyo.Objective(expr=wait_area + float(penalty) * unserved + float(window_cost) * sum(m.x[i] for i in idx),
-                          sense=pyo.minimize)
 
-    opt = pyo.SolverFactory("appsi_highs")
-    opt.config.stream_solver = bool(verbose)
-    opt.config.mip_gap = float(mip_gap)
-    if time_limit:
-        opt.config.time_limit = float(time_limit)
-    opt.highs_options["output_flag"] = bool(verbose)
-    if time_limit:
-        opt.highs_options["time_limit"] = float(time_limit)
-    quiet = logging.getLogger("highs_quiet")
-    quiet.setLevel(logging.CRITICAL)
-    opt.config.solver_output_logger = quiet
-    res = opt.solve(m)
-    tc = getattr(res, "termination_condition", None)
-    if tc is not None and tc not in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.maxTimeLimit):
-        raise RuntimeError(f"MILP failed: {tc}")
+    def solve(limit, gap):
+        opt = pyo.SolverFactory("appsi_highs")
+        opt.config.stream_solver = bool(verbose)
+        opt.config.mip_gap = float(gap)
+        opt.highs_options["output_flag"] = bool(verbose)
+        if limit:
+            opt.config.time_limit = float(limit)
+            opt.highs_options["time_limit"] = float(limit)
+        quiet = logging.getLogger("highs_quiet")
+        quiet.setLevel(logging.CRITICAL)
+        opt.config.solver_output_logger = quiet
+        res = opt.solve(m)
+        tc = getattr(res, "termination_condition", None)
+        if tc is not None and tc not in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.maxTimeLimit):
+            raise RuntimeError(f"MILP failed: {tc}")
+        try:
+            bound = float(res.problem.lower_bound)              # best lower bound proved (minimisation)
+        except Exception:
+            bound = float("nan")
+        return tc, bound
+
+    t_start = time.time()
+    # stage 1: fewest unserved passengers
+    m.obj1 = pyo.Objective(expr=unserved, sense=pyo.minimize)
+    tc1, bound1 = solve(0.25 * time_limit if time_limit else None, 0.0)
+    u_star = float(pyo.value(unserved))
+    # stage 2: smallest total waiting time among the schedules with (almost) that few unserved
+    m.obj1.deactivate()
+    m.keep_unserved = pyo.Constraint(expr=unserved <= u_star + float(unserved_tol))
+    m.obj2 = pyo.Objective(expr=wait_area + float(window_cost) * sum(m.x[i] for i in idx), sense=pyo.minimize)
+    left = max(1.0, float(time_limit) - (time.time() - t_start)) if time_limit else None
+    tc, bound = solve(left, mip_gap)
 
     # ---- solutions
     Dm = None
@@ -198,10 +263,13 @@ def solve_fluid_milp(
         if Dm.shape[0] != N or Dm.shape[1] < R or Dm.shape[2] != T:
             raise ValueError(f"demand must be (R>={R}, {T}) or ({N}, R>={R}, {T}); got {np.shape(demand)}")
     sols, cap_profile = [], np.zeros((N, T))
+    chosen = [(nn, rr, l, s) for (nn, rr, l, s) in idx if pyo.value(m.x[nn, rr, l, s]) > 0.5]
     for n in range(N):
+        by_lane = {r: sorted((s, l) for (nn, rr, l, s) in chosen if nn == n and rr == r) for r in range(R)}
+        if pack_lanes:
+            by_lane = pack_to_lowest_lanes(by_lane, mu)
         for r in range(R):
-            wins = sorted((s, l) for (nn, rr, l, s) in idx
-                          if nn == n and rr == r and pyo.value(m.x[nn, rr, l, s]) > 0.5)
+            wins = sorted(by_lane[r])
             starts = np.array([s for s, _ in wins], dtype=int)
             lens = np.array([l for _, l in wins], dtype=int)
             cov = np.zeros(T, dtype=bool)
@@ -216,15 +284,13 @@ def solve_fluid_milp(
 
     if not return_info:
         return sols
-    try:                                                           # best lower bound proved by the solver (minimisation)
-        bound = float(res.problem.lower_bound)
-    except Exception:
-        bound = float("nan")
-    queue = [fluid_cost(A[n], cap_profile[n], dt, penalty) for n in range(N)]
-    obj_val = float(sum(q[0] for q in queue))
+    queue = [fluid_cost(A[n], cap_profile[n], dt) for n in range(N)]
+    area = float(sum(q[0] for q in queue))
+    obj_val = float(pyo.value(m.obj2))
+    n_pax = float(A.sum())
     info = dict(
-        objective=obj_val, objective_per_pax=obj_val / float(A.sum()) if A.sum() > 0 else float("nan"),
-        wait_area=float(sum(q[1] for q in queue)), unserved=float(sum(q[2] for q in queue)),
+        unserved=float(sum(q[1] for q in queue)), unserved_status=str(tc1), unserved_bound=bound1,
+        wait_area=area, wait_mean=area / n_pax if n_pax > 0 else float("nan"),
         n_windows=int(sum(s.n_rects for s in sols)), status=str(tc),
         bound=bound, gap=(obj_val - bound) / abs(obj_val) if np.isfinite(bound) and obj_val else float("nan"),
     )
@@ -232,11 +298,11 @@ def solve_fluid_milp(
 
 
 # planner level (same shape as SecurityPlanner.run_multi)
-def run_fluid_milp(planner, lengths, K_total, length_totals=None, penalty=30.0, n_lanes=None,
-                   time_limit=None, mip_gap=0.0, symmetry_breaking=True):
+def run_fluid_milp(planner, lengths, K_total, length_totals=None, unserved_tol=1e-3, n_lanes=None,
+                   time_limit=None, mip_gap=0.0, symmetry_breaking=True, pack_lanes=True, prefix_lanes=False):
     """
     Queue-optimal counterpart of planner.run_multi(lengths, theta, K_total, length_totals): same arguments (lengths in
-    hours), same PlannerResults (schedule, df_curves, coverage, report in planner.report). theta is not used: the result
+    hours; K_total is an upper bound, fewer windows may be used), objective lexicographic (unserved, then wait), same PlannerResults (schedule, df_curves, coverage, report in planner.report). theta is not used: the result
     has theta=0 and theta_rows=0, so its `objective` is the covered demand. Returns (PlannerResults, info).
     n_lanes : number of lanes (default: the same as run_multi, min(demand layers, servers)).
     """
@@ -258,8 +324,9 @@ def run_fluid_milp(planner, lengths, K_total, length_totals=None, penalty=30.0, 
 
     sols, info = solve_fluid_milp(
         planner.arrivals.to_numpy(), planner.rate_by_label, labels, lengths_cells, planner.bin_minutes,
-        K_total=K_total, length_per_day=totals_cells, penalty=penalty,
+        K_total=K_total, length_per_day=totals_cells, unserved_tol=unserved_tol,
         demand=planner.demand_grid[:n_usable], symmetry_breaking=symmetry_breaking,
+        pack_lanes=pack_lanes, prefix_lanes=prefix_lanes,
         time_limit=time_limit, mip_gap=mip_gap, return_info=True)
 
     zeros = np.zeros(n_rows)
@@ -272,5 +339,6 @@ def run_fluid_milp(planner, lengths, K_total, length_totals=None, penalty=30.0, 
         demand_grid=planner.demand_grid, server_labels=tuple(labels), server_schedule=schedule, df_curves=df_curves,
         coverage=planner.report.total.coverage,
         lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), length_totals=length_totals,
-        theta_rows=tuple(0.0 for _ in labels))
+        theta_rows=tuple(0.0 for _ in labels),
+        coverage_slot=float(np.minimum(df_curves["demand"], df_curves["processing"]).sum() / df_curves["demand"].sum()))
     return planner.results, info

@@ -9,6 +9,7 @@ from matplotlib.patches import Rectangle, Patch
 from scipy.stats import gaussian_kde
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
+import app.services.simulation_batch as sb
 import json
 
 GREY, ORANGE, RED, WHITE = "#9e9e9e", "#00b70f", "#ff0000", "#ffffff"
@@ -66,6 +67,15 @@ def parse_blocks(x):
     d = json.loads(x) if isinstance(x, str) else x
     return {k: [tuple(int(v) for v in b) for b in bl] for k, bl in d.items()}
 
+def theta_label(theta):
+    """'0.6' if the same everywhere; '0.6 (row 1: 0)' if only the first row differs; else 'min-max'."""
+    th = np.atleast_1d(np.asarray(theta, dtype=float))
+    if len(np.unique(th)) == 1:
+        return f"{th[0]:g}"
+    if len(th) > 1 and len(np.unique(th[1:])) == 1:
+        return f"{th[1]:g} (row 1: {th[0]:g})"
+    return f"{th.min():g}-{th.max():g}"
+
 def shifts_label(blocks, bin_minutes):
     lens = pd.Series([l * bin_minutes / 60 for bl in blocks.values() for _, l in bl]).round(2)
     counts = lens.value_counts().sort_index()
@@ -73,7 +83,7 @@ def shifts_label(blocks, bin_minutes):
 
 def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
                 metrics=None, demand_curve=None, processing_curve=None,
-                show_second=True, title_prefix=None):
+                show_second=True, df_timeline=None, df_kpis=None, title_prefix="", queue_max=None):
     D = np.asarray(D, dtype=np.float64)
     labels = list(labels)
     time_values = pd.to_datetime(pd.Series(list(time_values))).reset_index(drop=True)
@@ -81,10 +91,14 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     if len(time_values) != T:
         raise ValueError(f"time_values has {len(time_values)} entries, D has {T} bins")
 
-    cov, obj, coverage = coverage_from_arrays(D, blocks, labels, theta)
+    cov, _, coverage = coverage_from_arrays(D, blocks, labels, theta)
+    coverage_slot = None
+    if demand_curve is not None and processing_curve is not None:
+        dem_, proc_ = np.asarray(demand_curve, float), np.asarray(processing_curve, float)
+        coverage_slot = float(np.minimum(dem_, proc_).sum() / dem_.sum()) if dem_.sum() > 0 else float("nan")
     if metrics is not None:                                   # stored values win (title consistent with the df)
-        obj = metrics.get("objective", obj)
         coverage = metrics.get("coverage", coverage)
+        coverage_slot = metrics.get("coverage_slot", coverage_slot)
 
     flat = [(labels.index(l), s, ln) for l, bl in blocks.items() for s, ln in bl]
     multi_length = len({ln for _, _, ln in flat}) > 1
@@ -95,11 +109,16 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     x_edges = np.append(x0, x0[-1] + width)
     edge = dict(edgecolor="lightgray", linewidth=0.3)
 
-    if show_second:
-        fig, (ax, ax2) = plt.subplots(2, 1, figsize=(10, 0.45 * n_rows + 4), sharex=True,
-                                      gridspec_kw={"height_ratios": [max(2, 0.45 * n_rows), 2]})
+    show_queue = df_timeline is not None and len(df_timeline) > 0
+    panels = ["blocks"] + (["curves"] if show_second else []) + (["queue"] if show_queue else [])
+    ratios = {"blocks": 2, "curves": 2, "queue": 2}
+    if len(panels) == 1:
+        fig, ax = plt.subplots(figsize=(10, 0.3 * n_rows + 2)); axs = [ax]
     else:
-        fig, ax = plt.subplots(figsize=(10, 0.45 * n_rows + 2)); ax2 = None
+        fig, axs = plt.subplots(len(panels), 1, sharex=True, figsize=(10, 0.3 * n_rows + 1 * len(panels) + 1),
+                                gridspec_kw={"height_ratios": [ratios[p] for p in panels]})
+    axd = dict(zip(panels, axs))
+    ax, ax2, ax3 = axd["blocks"], axd.get("curves"), axd.get("queue")
 
     for c in range(n_rows):
         d, k = D[c], cov[c]
@@ -119,27 +138,81 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
                        Patch(color=ORANGE, label="demand uncovered")], loc="upper right", fontsize=8)
 
     if ax2 is not None:
-        ax2.stairs(np.asarray(demand_curve) / bin_minutes, x_edges, label="demand", color="tab:blue")
-        ax2.stairs(np.asarray(processing_curve) / bin_minutes, x_edges, label="processing", color="tab:green")
-        ax2.set_ylabel("pax / min"); ax2.legend(fontsize=8)
+        dem = np.asarray(demand_curve)
+        proc = np.asarray(processing_curve)
+        within = np.minimum(dem, proc)
+        pct = within.sum() / dem.sum() if dem.sum() > 0 else float("nan")
 
-    axes = [ax] + ([ax2] if ax2 is not None else [])
+        ax2.stairs(within, x_edges, baseline=0, fill=True, color='royalblue', alpha=0.35,
+           linewidth=0, label=f"demand within capacity ({pct:.1%})")
+        ax2.stairs(dem, x_edges, label="demand", color="royalblue", linewidth=1.5)
+        ax2.stairs(proc, x_edges, label="processing", color="tab:green", linewidth=1.5)
+        ax2.set_ylabel(f"pax / {bin_minutes:g} min")
+        ax2.legend(fontsize=8)
+
+    if ax3 is not None:
+        tl = df_timeline.sort_values("time_bin")
+        tb = mdates.date2num(pd.to_datetime(tl["time_bin"]))
+        pick = lambda base: f"{base}_median" if f"{base}_median" in tl else f"{base}_mean"
+
+        # left axis: queue
+        if "queue_length_p5" in tl:
+            ax3.fill_between(tb, tl["queue_length_p5"], tl["queue_length_p95"], step="post",
+                             color="tab:red", alpha=0.12, linewidth=0)
+            ax3.fill_between(tb, tl["queue_length_p25"], tl["queue_length_p75"], step="post",
+                             color="tab:red", alpha=0.25, linewidth=0)
+        q_col = pick("queue_length")
+        l1, = ax3.step(tb, tl[q_col], where="post", color="tab:red", linewidth=1.5,
+                       label=q_col.replace("queue_length_", "queue "))
+        ax3.set_ylabel("queue (pax)", color="tab:red")
+        ax3.tick_params(axis="y", colors="tab:red")
+        ax3.set_ylim(0, queue_max)
+
+        # right axis: processing rate
+        ax3b = ax3.twinx()
+        handles = [l1]
+        p_col = pick("processing_rate")
+        if p_col in tl:
+            if "processing_rate_p25" in tl:
+                ax3b.fill_between(tb, tl["processing_rate_p25"], tl["processing_rate_p75"], step="post",
+                                  color="tab:green", alpha=0.2, linewidth=0)
+            l2, = ax3b.step(tb, tl[p_col], where="post", color="tab:green", linewidth=1.5,
+                            label=p_col.replace("_", " "))
+            handles.append(l2)
+        if "theoretical_processing_rate" in tl:
+            l3, = ax3b.step(tb, tl["theoretical_processing_rate"], where="post", color="tab:green",
+                            linewidth=1, linestyle="--", label="theoretical processing rate")
+            handles.append(l3)
+        ax3b.set_ylabel("processing rate", color="tab:green")
+        ax3b.tick_params(axis="y", colors="tab:green")
+        ax3b.set_ylim(bottom=0)
+        ax3.legend(handles=handles, fontsize=8, loc="upper left")
+
+    axes = list(axs)
     for a in axes:
         a.xaxis.set_major_locator(mdates.HourLocator())
         a.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
         a.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=range(0, 60, 15)))
         a.set_axisbelow(True) 
         a.grid(axis="x", which="major", alpha=0.4)
-    th = np.unique(np.asarray(theta, dtype=float))
-    th_txt = f"{th[0]:g}" if len(th) == 1 else f"{th.min():g}-{th.max():g}"
-    title = (f"L: {shifts_label(blocks, bin_minutes)} |  theta = {th_txt} | {len(flat)} blocks  | "
-             f"obj={obj:.2f} | coverage = {coverage:.1%}")
-    fig.suptitle(f"{title_prefix} — {title}" if title_prefix else title)
+    slot_txt = f"{coverage_slot:.1%}" if coverage_slot is not None else "n/a"
+    sim = {}
+    if df_kpis is not None and len(df_kpis) > 0:
+        sim = df_kpis.iloc[0].to_dict()
+    elif metrics is not None:
+        sim = metrics
+    sim_txt = ""
+    if "qtime_mean" in sim and "n_unserved" in sim:
+        sim_txt = f" | qtime = {sim['qtime_mean']:.2f} min | unserved = {sim['n_unserved']:.1f}"
+    title = (f"L: {shifts_label(blocks, bin_minutes)} | theta = {theta_label(theta)} | "
+             f"coverage = {coverage:.1%} | coverage slot = {slot_txt}{sim_txt}")
+
+    fig.suptitle(f"{title_prefix} {title}" if title_prefix else title, fontsize=10)
     fig.autofmt_xdate(rotation=90)
     fig.tight_layout()
     plt.show()
 
-def plot_allocation(res, show_second=True):
+def plot_allocation(res, show_second=True, df_timeline=None, df_kpis=None, queue_max=None):
     """Backward-compatible wrapper: only extracts the minimal inputs from `res`."""
     tv = pd.to_datetime(res.df_curves["time"]).reset_index(drop=True)
     D = np.asarray(res.demand_grid, dtype=np.float64)
@@ -149,31 +222,45 @@ def plot_allocation(res, show_second=True):
                        (res.theta_rows if getattr(res, 'theta_rows', None) is not None else res.theta), res.bin_minutes,
                        demand_curve=res.df_curves["demand"].to_numpy()[:D.shape[1]],
                        processing_curve=res.df_curves["processing"].to_numpy()[:D.shape[1]],
-                       show_second=show_second)
+                       df_timeline=df_timeline, df_kpis=df_kpis,
+                       show_second=show_second, queue_max=queue_max)
 
-def plot_run_from_row(row, D, labels, time_values, bin_minutes, demand_curve=None,
-                      rate_by_label=None, show_second=True, check=True):
+def plot_run_from_row(row, D, labels, time_values, bin_minutes, queue_max, demand_curve=None,
+                      rate_by_label=None, show_second=True, check=False, show_queue=True):
     """
-    Plot a df_pert row: blocks come from row['blocks'], theta/objective/coverage from the row itself.
+    Plot a df_pert row: blocks, theta, coverage, coverage_slot, qtime_mean and n_unserved all come from the row.
     D, labels, time_values, demand_curve: from the (single) demand the experiment was run on.
     rate_by_label (planner.rate_by_label): needed only to draw the processing curve.
+    df_timeline: optional sim_results.df_timeline, for the queue panel (not stored in df_pert).
     check: warns if the demand grid in hand is not the one the row was generated with.
     """
     blocks = parse_blocks(row["blocks"])
     D = np.asarray(D, dtype=np.float64)
     if check:
         cov = coverage_mask(blocks, labels, D.shape)
-        cov_ = float(D[cov].sum()) / float(D.sum())
-        if not (np.isclose(cov_, row["coverage"], atol=1e-9)
-                and np.isclose(float(D[cov].sum()), row["covered_demand"], atol=1e-6)):
-            print(f"WARNING: demand grid differs from the one used for this run "
-                  f"(recomputed coverage={cov_:.2%}, stored {row['coverage']:.2%}).")
+        covered = float(D[cov].sum())
+        if not (np.isclose(covered / float(D.sum()), row["coverage"], atol=1e-9)
+                and np.isclose(covered, row["covered_demand"], atol=1e-6)):
+            print("WARNING: demand grid differs from the one used for this run.")
+
+    theta = np.full(D.shape[0], float(row["theta"]))              # per-row theta, as in the experiment
+    tf = row.get("theta_first", None)
+    if tf is not None and pd.notna(tf):
+        theta[0] = float(tf)
+
     proc = (processing_from_blocks(blocks, rate_by_label, D.shape[1])
             if rate_by_label is not None else None)
-    plot_blocks(D, blocks, labels, time_values, row["theta"], bin_minutes,
-                       metrics={"objective": row["objective"], "coverage": row["coverage"]},
-                       demand_curve=demand_curve, processing_curve=proc, show_second=show_second,
-                       title_prefix=f"rep {row['rep']}")
+    keys = ["coverage", "coverage_slot", "qtime_mean", "n_unserved"]
+    metrics = {k: row[k] for k in keys if k in row.index and pd.notna(row[k])}
+
+    df_timeline = None
+    tl = row.get("timeline", None)
+    if show_queue and isinstance(tl, str):
+        df_timeline = sb.timeline_to_df(tl)
+
+    plot_blocks(D, blocks, labels, time_values, theta, bin_minutes, metrics=metrics,
+                demand_curve=demand_curve, processing_curve=proc, show_second=show_second,
+                df_timeline=df_timeline, title_prefix=f"rep {row['rep']}", queue_max=queue_max)
 
 def save_context(planner, path):
     """
@@ -197,12 +284,12 @@ def load_context(path):
         bin_minutes=float(z["bin_minutes"]), arrivals=z["arrivals"],
         rate_by_label=dict(zip([str(k) for k in z["rate_labels"]], z["rate_values"].tolist())))
 
-def plot_row(row, ctx, show_second=True, check=True):
+def plot_row(row, ctx, queue_max=None, show_second=True, check=True, show_queue=True):
     """Plot a df_pert row (Series) using the context saved by save_context: no planner needed."""
     labels = [l for l in ctx["labels"]][:ctx["D"].shape[0]]
-    return plot_run_from_row(row, ctx["D"], labels, ctx["time_values"], ctx["bin_minutes"],
-                             demand_curve=ctx["arrivals"], rate_by_label=ctx["rate_by_label"],
-                             show_second=show_second, check=check)
+    return plot_run_from_row(row=row, D=ctx["D"], labels=labels, time_values=ctx["time_values"], bin_minutes=ctx["bin_minutes"],
+                             queue_max=queue_max, demand_curve=ctx["arrivals"], rate_by_label=ctx["rate_by_label"],
+                             show_second=show_second, check=check, show_queue=show_queue)
 
 
 # simulation results plotting

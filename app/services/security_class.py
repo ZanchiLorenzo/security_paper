@@ -1,7 +1,7 @@
 from app.services.entities import  Interval, Flight, Passenger
 from app.services.simulation import QueueSimulationSinglequeue
 from app.services.samplers import ArrivalScenario, ArrivalGenerator, expected_arrivals
-from app.services.utils import sort_labels_by_priority, get_processing_rate_by_label, mean_processing_rate, validate_intervals
+from app.services.utils import sort_labels_by_priority, get_processing_rate_by_label, validate_intervals
 from app.services.coverage_dp import CoverageReport, coverage_report, solve_coverage_batch, allocate_budget, solve_allocated, coverage_report_multi, solve_coverage_batch_multi, allocate_budget_multi, solve_allocated_multi, allocate_milp, MultiAllocation
 import app.services.metrics as metrics
 import concurrent.futures
@@ -15,28 +15,53 @@ import logging
 logger = logging.getLogger(__name__)
 
 # arrivals -> demand grid
-def arrivals_to_demand_grid(arrivals, mean_processing_rate: float, bin_minutes: float = 15.0):
+def arrivals_to_demand_grid_het(arrivals, rates):
     """
-    Convert arrivals per bin to a demand grid for the coverage DP.
-    The demand grid is a 2-D array D of shape (n_counters, T) with values in [0, 1] 
-    representing the fraction of each counter-bin that is needed to cover the demand.
-
-    arrivals             : (T,) pax arriving in each bin
-    mean_processing_rate : pax per hour processed by one counter
-    returns D            : (n_counters, T) float in [0, 1]
+    Demand grid with the real rate of every lane (instead of the mean rate), layers in priority order.
+ 
+    arrivals : (T,) or (N, T) pax per bin
+    rates    : pax per bin of the lanes in priority order, mu_1..mu_M (planner.rate_by_label[label] for label in server_labels)
+    returns  : D of shape (R, T) or (N, R, T), D[..., r, t] = clip((a_t - C_{r-1}) / mu_r, 0, 1), C_r = mu_1 + .. + mu_r
+ 
+    Layer r is the share of lane r that is needed in the slot once the first r-1 lanes are full: when the lanes that are
+    open are the first k, the covered demand is sum_r mu_r d_r = min(a_t, C_k). Layers beyond the M lanes (needed only if
+    the lanes cannot absorb the peak) use the mean rate; they are dropped later, as before. With equal rates this is the
+    previous grid: D = clip(a / mu - (r - 1), 0, 1).
     """
     a = np.asarray(arrivals, dtype=np.float64)
-    if a.ndim != 1:
-        raise ValueError("arrivals must be 1-D (T,)")
-    if mean_processing_rate <= 0 or bin_minutes <= 0:
-        raise ValueError("mean_processing_rate and bin_minutes must be > 0")
-    pax_per_counter_bin = mean_processing_rate * (bin_minutes / 60.0)
-    required_exact = a / pax_per_counter_bin
-    n_counters = int(np.ceil(required_exact.max() - 1e-9)) if a.size else 0
-    if n_counters == 0:
+    c = np.asarray(rates, dtype=np.float64)
+    if c.ndim != 1 or c.size == 0 or (c <= 0).any():
+        raise ValueError("rates must be a non-empty 1-D array of positive pax per bin")
+    a_max = float(a.max()) if a.size else 0.0
+    if a_max <= 0:
         raise ValueError("no arrivals: the demand grid would be empty")
-    D = np.clip(required_exact[None, :] - np.arange(n_counters)[:, None], 0.0, 1.0)
-    return D
+    ext = list(c)
+    while sum(ext) < a_max:                                   # virtual layers with the mean rate beyond the M lanes
+        ext.append(float(c.mean()))
+    ext = np.asarray(ext)
+    cum = np.cumsum(ext)
+    R = int(np.searchsorted(cum, a_max - 1e-9 * float(c.mean()), side="left")) + 1     # smallest R with C_R >= max a
+    mu_r, lo = ext[:R], np.concatenate([[0.0], cum[:R - 1]])
+    if a.ndim == 1:
+        return np.clip((a[None, :] - lo[:, None]) / mu_r[:, None], 0.0, 1.0)
+    return np.clip((a[:, None, :] - lo[None, :, None]) / mu_r[None, :, None], 0.0, 1.0)
+
+def slotwise_coverage(demand, processing) -> float:
+    """
+    "True" coverage of a schedule: sum_t min(arrivals_t, capacity_t) / sum_t arrivals_t, with the open lanes' capacity pooled
+    (any lane serves any passenger). demand / processing: pax per bin, e.g. the columns of df_curves.
+    The layer coverage (PlannerResults.coverage) assigns each layer to its own lane and is a lower bound of this one.
+    """
+    d = np.asarray(demand, dtype=np.float64)
+    p = np.asarray(processing, dtype=np.float64)
+    total = float(d.sum())
+    return float(np.minimum(d, p).sum() / total) if total > 0 else float("nan")
+
+def _slim_report(rep: CoverageReport, coverage_slot: float) -> CoverageReport:
+    """The report already comes slim from coverage_dp; add the true (slot-wise) coverage to total."""
+    total = rep.total.copy()
+    total["coverage_slot"] = coverage_slot
+    return CoverageReport(blocks=rep.blocks, rows=rep.rows, total=total)
 
 # -- Planner on single day --
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -52,13 +77,14 @@ class PlannerResults:
     server_labels: tuple[str, ...]                  # ordered by priority (first opened first)
     server_schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]]   # label -> [(start, end), ...]
     df_curves: pd.DataFrame                    # one row per bin (see SecurityPlanner.run)
-    coverage: float                            # total covered demand, from report.total.coverage
+    coverage: float                            # layer coverage: sum over blocks of the covered load of their layer / total load (what the DP maximises)
  
     # multi-length runs (empty for run())
     lengths: tuple = ()                        # allowed shift lengths, hours
     lengths_cells: tuple = ()                  # same, in bins
     length_totals: Optional[dict] = None       # {hours: max shifts across servers}
     theta_rows: Optional[tuple] = None         # theta actually used on each row (server_labels order); None = theta everywhere
+    coverage_slot: Optional[float] = None      # true coverage: sum_t min(arrivals_t, capacity_t) / sum_t arrivals_t (see slotwise_coverage)
 
 class SecurityPlanner:
     """
@@ -73,16 +99,24 @@ class SecurityPlanner:
         if not server_registry:
             raise ValueError("server_registry cannot be empty.")
 
+        step = self._regular_step(arrivals.index)
+        horizon_end = arrivals.index[0].normalize() + pd.Timedelta(days=1)
+        if horizon_end is not None and pd.Timestamp(horizon_end) > arrivals.index[-1] + step:
+            extra = pd.date_range(arrivals.index[-1] + step, pd.Timestamp(horizon_end), freq=step, inclusive="left")
+            arrivals = pd.concat([arrivals, pd.Series(0.0, index=extra)])
+        
         self.arrivals = arrivals.astype(float)
         self.time_values: pd.DatetimeIndex = arrivals.index
-        self.bin_duration = self._regular_step(self.time_values)
+        self.bin_duration = step
+    
         self.bin_minutes = self.bin_duration.total_seconds() / 60.0
 
         self.server_registry = server_registry
         self.server_labels = sort_labels_by_priority(server_registry)
         self.rate_by_label, _ = get_processing_rate_by_label(server_registry, self.bin_minutes)
 
-        self.demand_grid = arrivals_to_demand_grid(self.arrivals.to_numpy(), mean_processing_rate(server_registry), self.bin_minutes)
+        rates_in_order = [self.rate_by_label[l] for l in self.server_labels]
+        self.demand_grid = arrivals_to_demand_grid_het(self.arrivals.to_numpy(), rates_in_order)
 
         self.results: PlannerResults | None = None
         self.report: CoverageReport | None = None
@@ -132,7 +166,8 @@ class SecurityPlanner:
  
         # get coverage report
         row_labels = list(self.server_labels[:n_usable]) + ["no server"] * (n_rows - n_usable)
-        self.report = coverage_report(D=self.demand_grid, sols=sols, L=L_cells, time_values=self.time_values, theta=theta, row_labels=row_labels)
+        report = coverage_report(D=self.demand_grid, sols=sols, L=L_cells, time_values=self.time_values, theta=theta, row_labels=row_labels)
+        
         # server schedule: row c is staffed by the c-th server in priority order
         schedule: dict[str, list[tuple[dt.datetime, dt.datetime]]] = {}
         for label, sol in zip(labels, sols):
@@ -162,7 +197,10 @@ class SecurityPlanner:
                 dtype=object,
             ),
         })
- 
+
+        cov_slot = slotwise_coverage(df_curves["demand"], df_curves["processing"])
+        self.report = _slim_report(report, cov_slot)
+
         # output results
         self.results = PlannerResults(
             L=L,
@@ -176,6 +214,7 @@ class SecurityPlanner:
             df_curves=df_curves,
             coverage=self.report.total.coverage,
             theta_rows=tuple(float(theta) for _ in labels),
+            coverage_slot=cov_slot,
         )
         return self.results
  
@@ -226,7 +265,6 @@ class SecurityPlanner:
         labels = self.server_labels[:n_usable]
  
         theta_rows = np.full(n_usable, float(theta))
- 
         if theta_first is not None:
             theta_rows[0] = float(theta_first)
  
@@ -239,9 +277,11 @@ class SecurityPlanner:
         row_labels = list(labels) + ["no server"] * (n_rows - n_usable)
         theta_report = np.append(theta_rows, np.full(n_rows - n_usable, float(theta)))
  
-        self.report = coverage_report_multi(D=self.demand_grid, sols=sols, time_values=self.time_values, row_labels=row_labels, theta=theta_report)
+        report = coverage_report_multi(D=self.demand_grid, sols=sols, time_values=self.time_values, row_labels=row_labels, theta=theta_report)
         schedule, df_curves = self._schedule_and_curves(sols, labels)
- 
+        cov_slot = slotwise_coverage(df_curves["demand"], df_curves["processing"])
+        self.report = _slim_report(report, cov_slot)
+
         self.results = PlannerResults(
             L=lengths_h[-1], L_cells=lengths_cells[-1],
             theta=theta, K_total=K_total, bin_minutes=self.bin_minutes,
@@ -250,6 +290,7 @@ class SecurityPlanner:
             coverage=self.report.total.coverage,
             lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), length_totals=length_totals,
             theta_rows=tuple(float(t) for t in theta_rows),
+            coverage_slot=cov_slot,
         )
         return self.results
  
@@ -302,7 +343,8 @@ class MultiDayResults:
     server_labels: tuple                # layer r is operated by server_labels[r] (only the first len(labels) layers)
     server_schedule: dict               # label -> [(start, end), ...] over all days: input of the simulator
     df_curves: pd.DataFrame             # all days one after the other: time, demand, processing, servers, day
-    coverage: float                     # total covered demand / total demand
+    coverage: float                     # layer coverage (what the DP maximises): covered load / total load, all days
+    coverage_slot: float                # true coverage: sum min(arrivals, capacity) / sum arrivals, all days
     allocation: MultiAllocation         # rows (day, layer) in day-major order: row = n * n_layers + r
     day_results: tuple                  # one single-day PlannerResults per day: use it with plot_allocation
  
@@ -362,15 +404,12 @@ class MultiDayPlanner:
         self.server_labels = sort_labels_by_priority(server_registry)
         self.rate_by_label, _ = get_processing_rate_by_label(server_registry, self.bin_minutes)
  
-        # demand grid (N, R, T): rho = pax / (pax one server processes in a bin), split in unit-capacity layers.
+        # demand grid (N, R, T)
         # R is the same for all days, so that the layers are comparable and the rows of the MILP line up.
-        pax_per_server_bin = mean_processing_rate(server_registry) * self.bin_minutes / 60.0
-        rho = self.A / pax_per_server_bin
-        self.R = int(np.ceil(rho.max() - 1e-9)) if rho.size else 0
-        if self.R == 0:
-            raise ValueError("no arrivals: the demand grid would be empty")
-        self.demand_grid = np.clip(rho[:, None, :] - np.arange(self.R)[None, :, None], 0.0, 1.0)
- 
+        rates_in_order = [self.rate_by_label[l] for l in self.server_labels]
+        self.demand_grid = arrivals_to_demand_grid_het(self.A, rates_in_order)     # (N, R, T)
+        self.R = self.demand_grid.shape[1]
+        
         self.results: Optional[MultiDayResults] = None
         self.reports: Optional[list] = None               # CoverageReport of each day
         self.report: Optional[CoverageReport] = None      # all days together
@@ -447,9 +486,10 @@ class MultiDayPlanner:
             tv = self.time_values_by_day[n]
             row_labels = labels + ["no server"] * (R - n_use)
             rep = coverage_report_multi(D=self.demand_grid[n], sols=sols, time_values=tv, row_labels=row_labels, theta=theta)
-            reports.append(rep)
  
             sched_n, df_n = self._schedule_and_curves(sols, labels, tv, self.A[n])
+            rep = _slim_report(rep, slotwise_coverage(df_n["demand"], df_n["processing"]))
+            reports.append(rep)
             curve_parts.append(df_n.assign(day=n))
             for label, windows in sched_n.items():
                 schedule.setdefault(label, []).extend(windows)
@@ -459,7 +499,8 @@ class MultiDayPlanner:
  
         schedule = {label: sorted(w) for label, w in schedule.items()}
         self.reports = reports
-        self.report = self._merge_reports(reports)
+        df_all = pd.concat(curve_parts, ignore_index=True)
+        self.report = self._merge_reports(reports, df_all)
         self.results = MultiDayResults(
             lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), theta=theta,
             K_total=None if K_total is None else int(K_total), 
@@ -467,12 +508,13 @@ class MultiDayPlanner:
             K_day=day_caps,
             bin_minutes=self.bin_minutes, days=self.days, demand_grid=self.demand_grid,
             server_labels=tuple(labels), server_schedule=schedule,
-            df_curves=pd.concat(curve_parts, ignore_index=True),
-            coverage=float(self.report.total.coverage), 
+            df_curves=df_all,
+            coverage=float(self.report.total.coverage),
+            coverage_slot=float(self.report.total.coverage_slot),
             allocation=alloc, 
             day_results=tuple(day_results))
         return self.results
- 
+
     def shifts_per_day(self) -> pd.DataFrame:
         """Number of shifts of each length opened on each day (from the schedule actually built)."""
         if self.results is None:
@@ -562,12 +604,12 @@ class MultiDayPlanner:
             demand_grid=self.demand_grid[n], server_labels=tuple(labels), server_schedule=sched,
             df_curves=df, coverage=float(rep.total.coverage),
             lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells),
-            theta_rows=tuple(float(theta) for _ in labels),
+            theta_rows=tuple(float(theta) for _ in labels), coverage_slot=float(rep.total.coverage_slot),
         )
         fields = {f.name for f in dataclasses.fields(PlannerResults)}
         return PlannerResults(**{k: v for k, v in values.items() if k in fields})
  
-    def _merge_reports(self, reports: list) -> CoverageReport:
+    def _merge_reports(self, reports: list, df_curves: pd.DataFrame) -> CoverageReport:
         """Reports of all days in one: blocks and rows get a 'day' column, total is recomputed."""
         blocks, rows = [], []
         for n, rep in enumerate(reports):
@@ -582,10 +624,11 @@ class MultiDayPlanner:
  
         keys = []
         for rep in reports:                      # n_blocks_<length> only exists for the lengths actually used
-            keys += [c for c in rep.total.index if c != "coverage" and c not in keys]
+            keys += [c for c in rep.total.index if c not in ("coverage", "coverage_slot") and c not in keys]
         total = {c: float(sum(rep.total.get(c, 0.0) for rep in reports)) for c in keys}
         total["n_blocks"] = int(total["n_blocks"])
         total["coverage"] = total["covered_demand"] / total["demand"] if total["demand"] > 0 else np.nan
+        total["coverage_slot"] = slotwise_coverage(df_curves["demand"], df_curves["processing"])
         return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
  
 def _regular_step(index: pd.DatetimeIndex) -> pd.Timedelta:
@@ -596,8 +639,6 @@ def _regular_step(index: pd.DatetimeIndex) -> pd.Timedelta:
     if not (steps == steps[0]).all():
         raise ValueError("the time index of arrivals must be regular (constant bin length).")
     return pd.Timedelta(steps[0])
-
-
 
 # -- Simulator --
 @dataclasses.dataclass

@@ -7,12 +7,12 @@ blocks = {label: [(start_slot, length_slots), ...]}  sorted, 0-based, inside [0,
     fluid_diagnostics(arrivals, rates, blocks, bin_minutes) -> DataFrame (arrivals, capacity, queue per slot)
     local_search(...)                                      -> (best_blocks, trace DataFrame)
  
-Criterion: `penalty=P` -> single metric J = mean wait per passenger, an unserved one counting as P minutes
-(recommended); `penalty=None` -> lexicographic: 1) fewer unserved passengers, 2) lower mean wait.
+Criterion: `penalty=None` (default) -> LEXICOGRAPHIC: 1) fewer unserved passengers, 2) lower mean wait;
+`penalty=P` -> single metric J = mean wait per passenger, an unserved one counting as P minutes.
     - A move is "an unserved improvement" if it lowers the unserved by more than `unserved_tol` pax.
     - Otherwise it can only be taken if it lowers the wait AND keeps unserved <= best unserved so far + unserved_tol
       (the ceiling follows the best value, so the search cannot spend a gain it already made).
-    Coverage / objective are not optimised, only tracked in the trace.
+    Coverage, coverage_slot and objective are not optimised, only tracked in the trace.
  
 Moves: relocate one block anywhere in the day (|shift| <= max_shift if given), always in its own lane (no jumps
 between lanes), without overlapping the other blocks of the lane (it may jump over them).
@@ -89,9 +89,13 @@ def evaluate(blocks, arrivals, rates, D, labels, theta, bin_minutes):
             c = float(seg.sum())
             covered += c; idle += float((1.0 - seg).sum())
             objective += c - theta_rows[row_of[label]] * l
-    wait, unserved = fluid_metrics(arrivals, rates, blocks, bin_minutes)
+    a = np.asarray(arrivals, dtype=np.float64)
+    cap = capacity_per_slot(blocks, rates, len(a))
+    wait, unserved = _fluid_from_cap(a, cap, bin_minutes)
     return dict(q_fluid=wait, unserved_fluid=unserved, covered_demand=covered, idle_capacity=idle,
-                coverage=covered / float(D.sum()), objective=objective)
+                coverage=covered / float(D.sum()),                          # layer coverage (what the DP maximizes)
+                coverage_slot=float(np.minimum(a, cap).sum() / a.sum()),    # true coverage, pooled capacity
+                objective=objective)
  
 # neighbourhood
 def _fits(lane_blocks, s, l, T):
@@ -126,26 +130,29 @@ def _apply(blocks, move, l):
 # local search
 def local_search(arrivals, rates, D, labels, theta, blocks0, bin_minutes,
                  penalty=None, j_tol=1e-6,
-                 unserved_tol=0.5, wait_tol=1e-6, max_iter=500, max_shift=None,
+                 unserved_tol=1e-3, wait_tol=1e-6, max_iter=500, max_shift=None,
                  n_kicks=0, kick_size=3, seed=0, refine=15, verbose=True):
     """
     Descent on the fluid queue with two possible criteria.
  
-    penalty = P (minutes)  -> SINGLE METRIC (recommended):
+    penalty = P (minutes)  -> SINGLE METRIC:
         J = ((N - U) * wait + P * U) / N     N = total arrivals, U = unserved, wait = mean wait of the served.
         Mean wait per passenger, an unserved passenger counting as P minutes. Steepest descent on J: take the
         best relocation if it lowers J by more than j_tol, stop otherwise. Kicks are kept if J improves.
-    penalty = None         -> LEXICOGRAPHIC (unserved first, then wait), as before:
-        unserved_tol : pax. A move that lowers the unserved by more than this is an "unserved move"; the others must
-                       keep unserved <= best unserved so far + unserved_tol and lower the wait by more than wait_tol.
+    penalty = None         -> LEXICOGRAPHIC (default): unserved first, then wait:
+        unserved_tol : pax. A move that lowers the unserved by more than this is an "unserved move" (taken even if the
+                       wait gets worse); the others must keep unserved <= best unserved so far + unserved_tol and lower
+                       the wait by more than wait_tol. Tiny default (0.001 pax) = strictly lexicographic; raise it
+                       (e.g. 0.5) to ignore sub-passenger gains in unserved.
  
     theta     : only tracked (objective = covered - theta * capacity in the trace): a number or one value per row of D
-                (use res.theta_rows to keep the first-row theta). It does not drive the search.
+                (pass res.theta_rows to keep the first-row theta). It does not drive the search.
     max_shift : None = a block can jump anywhere in the day (in its own lane); int = at most that many slots away.
     n_kicks   : iterated local search: after the descent, `n_kicks` times apply `kick_size` random relocations
                 to the best schedule, descend again, keep the result only if it is better under the criterion.
     Returns (best_blocks, trace). trace: one row per accepted move (iter 0 = start) with metrics (and J if penalty is
-    given), `kick` = index of the kick that produced the row (0 = first descent), `move` = (label, block, new_start).
+    given), `kick` = index of the kick that produced the row (0 = first descent), `move` = (label, block, shift): the block, as numbered
+    in the lane before the move, moved by `shift` slots (negative = earlier).
     """
     a_slot = np.asarray(arrivals, dtype=np.float64)
     T = len(a_slot)
@@ -194,9 +201,10 @@ def local_search(arrivals, rates, D, labels, theta, blocks0, bin_minutes,
             if pick is None:
                 break
             u, _, move, cap, l, w = pick
+            shift = move[2] - blocks[move[0]][move[1]][0]                 # new start - old start (slots)
             blocks = _apply(blocks, move, l)
             u_best = min(u_best, u)
-            r = row(blocks, len(rows), kick, move)
+            r = row(blocks, len(rows), kick, (move[0], move[1], shift))
             rows.append(r)
             if verbose and len(rows) % 10 == 0:
                 extra = f" J={r['J']:.3f}" if Jf is not None else ""

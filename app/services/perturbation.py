@@ -13,7 +13,7 @@ def schedule_to_blocks(planner, res) -> dict:
             for s, e in windows
         )
     return out
- 
+
 def blocks_to_schedule(planner, blocks: dict) -> dict:
     """{label: [(start_slot, length_slots), ...]} -> {label: [(start_dt, end_dt), ...]}, same format as res.server_schedule."""
     t0, step = pd.Timestamp(planner.time_values[0]), planner.bin_duration
@@ -22,15 +22,15 @@ def blocks_to_schedule(planner, blocks: dict) -> dict:
                 for s, l in bl]
         for label, bl in blocks.items() if len(bl)
     }
- 
+
 def blocks_to_json(blocks: dict) -> str:
     return json.dumps({k: [[int(s), int(l)] for s, l in v] for k, v in blocks.items()})
- 
+
 def parse_blocks(x) -> dict:
     """Inverse of blocks_to_json (also accepts an already parsed dict). Safe to store in xlsx/csv."""
     d = x if isinstance(x, dict) else json.loads(x)
     return {k: [(int(s), int(l)) for s, l in v] for k, v in d.items()}
- 
+
 # coverage of a schedule
 def coverage_from_blocks(planner, res, blocks: dict) -> dict:
     """
@@ -61,7 +61,27 @@ def coverage_from_blocks(planner, res, blocks: dict) -> dict:
         coverage=covered / float(D.sum()),
         objective=objective,
     )
+
+def _slotwise(demand, processing) -> float:
+    """True coverage: sum_t min(demand_t, processing_t) / sum_t demand_t."""
+    d = np.asarray(demand, float); c = np.asarray(processing, float)
+    return float(np.minimum(d, c).sum() / d.sum()) if d.sum() > 0 else float("nan")
+
+def coverage_slotwise(arrivals, rate_by_label, blocks: dict) -> float:
+    """
+    True coverage of a schedule: sum_t min(arrivals_t, capacity_t) / sum_t arrivals_t,
+    with capacity_t = sum of the rates (pax per bin) of the lanes open at t.
+    arrivals: array (T,) of pax per bin; blocks: {label: [(start_slot, length_slots), ...]}.
+    """
+    a = np.asarray(arrivals, dtype=np.float64)
+    cap = np.zeros(len(a))
+    for label, bl in blocks.items():
+        for s, l in bl:
+            cap[int(s):int(s) + int(l)] += rate_by_label[label]
+    return _slotwise(a, cap)
  
+
+
 def res_with_blocks(planner, res, blocks: dict):
     """
     Copy of the planner result in which the schedule is replaced by `blocks`, so that any plot that
@@ -84,19 +104,20 @@ def res_with_blocks(planner, res, blocks: dict):
         server_schedule=blocks_to_schedule(planner, blocks),
         df_curves=df,
         coverage=coverage_from_blocks(planner, res, blocks)["coverage"],
+        coverage_slot=_slotwise(df["demand"], df["processing"]),
     )
- 
+
 # random movement of some block
 def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator, step: int = 1):
     """
-    Move n_moves randomly chosen blocks (any lane), each by exactly `step` slots (default 1), to the left or
+    Move n_moves randomly chosen blocks (any lane), by 1..step slots, to the left or
     to the right with equal probability. Lengths and lane assignment never change.
- 
+
     The result is always feasible: a block stays between its neighbours in the same lane (adjacent blocks
     are allowed; neighbours already moved count with their new position) and ends by slot T
     (no overhang, as in the allocator). A block that cannot move in any direction is skipped
     and another one is drawn.
- 
+
     Returns (new_blocks, moves): moves = [(label, block index, shift), ...] actually applied;
     len(moves) < n_moves only if too few blocks could move.
     """
@@ -111,13 +132,14 @@ def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator,
         s, l = bl[i]
         lo = bl[i - 1][0] + bl[i - 1][1] if i > 0 else 0
         hi = (bl[i + 1][0] if i < len(bl) - 1 else T) - l          # the block must end by T (no overhang)
-        shifts = [d for d in (-step, step) if lo <= s + d <= hi]
+        shifts = [d for m in range(1, step + 1) for d in (-m, m) if lo <= s + d <= hi]
         if not shifts:
             continue
         d = int(rng.choice(shifts))
         bl[i] = (s + d, l)
         moves.append((label, i, d))
     return new, moves
+
 
 _EDIT_KEYS = {"lane", "block", "shift", "length", "remove"}
 

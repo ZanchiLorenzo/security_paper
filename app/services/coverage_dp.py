@@ -296,76 +296,70 @@ class CoverageReport:
     rows: pd.DataFrame
     total: pd.Series
 
+def _report_from_blocks(D, blocks, n_rows, theta_r, row_labels) -> CoverageReport:
+    """Generate per-row and total tables from the block table."""
+    row_demand = D.sum(axis=1)
+    safe = lambda num, den: num / den if den > 0 else np.nan
+    by_row = lambda col: blocks.groupby("row")[col].sum().reindex(range(n_rows), fill_value=0).to_numpy().astype(float)
+    covered, capacity = by_row("covered_demand"), by_row("length")
+    n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0).to_numpy()
+
+    rows = pd.DataFrame({
+        "server": list(row_labels) if row_labels is not None else [None] * n_rows,
+        "n_blocks": n_blocks,
+        "demand": row_demand,
+        "covered_demand": covered,
+        "coverage": [safe(cv, dm) for cv, dm in zip(covered, row_demand)],
+    }).rename_axis("row")
+
+    total = {
+        "n_blocks": int(n_blocks.sum()),
+        "demand": float(row_demand.sum()),
+        "covered_demand": float(covered.sum()),
+        "coverage": safe(float(covered.sum()), float(row_demand.sum())),
+        "objective": float((covered - theta_r * capacity).sum()),      # sum of (covered - theta * length)
+    }
+    for l, n in blocks.groupby("length").size().items():               # how many blocks of each length
+        total[f"n_blocks_{int(l)}"] = int(n)
+    return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
+
+_BLOCK_COLS = ["row", "block", "length", "start_slot", "start_time", "end_time", "covered_demand", "utilization"]
+
+def _block_records(D, sols, time_values, fixed_length=None) -> pd.DataFrame:
+    """One line per block: where it is, how long, how much demand it covers, how busy it is."""
+    tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
+    step = tv.iloc[1] - tv.iloc[0]
+    recs = []
+    for c, sol in enumerate(sols):
+        lengths = [fixed_length] * len(sol.starts) if fixed_length is not None else sol.lengths
+        for b, (s0, l) in enumerate(zip(sol.starts, lengths)):
+            s0, l = int(s0), int(l)
+            covered = float(D[c, s0:s0 + l].sum())
+            recs.append(dict(row=c, block=b, length=l, start_slot=s0, start_time=tv.iloc[s0],
+                             end_time=tv.iloc[s0] + l * step, covered_demand=covered, utilization=covered / l))
+    return pd.DataFrame(recs, columns=_BLOCK_COLS)
+
 def coverage_report(D, sols, L, time_values, theta, row_labels=None) -> CoverageReport:
     """
-    Prepare a report of the coverage DP solution, including per-block and per-row statistics.
+    Report of the single-length DP solution.
 
     D    : (n_rows, T) demand grid in [0, 1]
     sols : list of Solution for the first len(sols) rows (the rows that have a server); the remaining
-           rows of D have no server: they count as demand with 0 blocks, 0 coverage
+           rows of D have no server: demand with 0 blocks
     L    : shift length in bins
-    time_values : (T,) datetime-like, the start time of each bin
-    row_labels : optional names for the index of rows (e.g. server labels, "no server" beyond)
-    theta : the theta used to compute the solutions
+    time_values : (T,) datetime-like, start time of each bin
+    theta : the theta used to compute the solutions (number, or one value per row)
+
+    blocks : row, block, length, start_slot, start_time, end_time, covered_demand, utilization
+    rows   : server, n_blocks, demand, covered_demand, coverage
+    total  : n_blocks, n_blocks_<L>, demand, covered_demand, coverage, objective = sum(covered - theta * length)
     """
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
         raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
-    row_demand = D.sum(axis=1)
-    total_demand = float(D.sum())
-    safe = lambda num, den: num / den if den > 0 else np.nan
- 
-    tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
-    step = tv.iloc[1] - tv.iloc[0]
- 
-    recs = []
-    for c, sol in enumerate(sols):
-        for b, s0 in enumerate(sol.starts):
-            s0 = int(s0)
-            covered = float(D[c, s0:s0 + L].sum())
-            rec = dict(row=c, block=b, start_slot=s0, end_slot=s0 + L)
-            rec.update(start_time=tv.iloc[s0], end_time=tv.iloc[s0] + L * step)
-            rec.update(
-                covered_demand=covered,
-                idle_capacity=L - covered,
-                utilization=covered / L,
-                objective=covered - theta * L
-            )
-                                         
-            recs.append(rec)
-    blocks = pd.DataFrame(recs)
-    if blocks.empty:
-        cols = ["row", "block", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization", "objective"]
-        blocks = pd.DataFrame(columns=cols)
-
-    n_rows = D.shape[0]
-    covered_by_row = blocks.groupby("row")["covered_demand"].sum().reindex(range(n_rows), fill_value=0.0)
-    n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0)
-    capacity = n_blocks.to_numpy() * L
-    rows = pd.DataFrame({
-        "n_blocks": n_blocks.to_numpy(),
-        "demand": row_demand,
-        "covered_demand": covered_by_row.to_numpy(),
-        "missed_demand": np.clip(row_demand - covered_by_row.to_numpy(), 0.0, None),
-        "idle_capacity": capacity - covered_by_row.to_numpy(),
-        "coverage": [safe(cv, dm) for cv, dm in zip(covered_by_row, row_demand)],
-        "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
-        "objective": covered_by_row.to_numpy() - theta * capacity,
-    }).rename_axis("row")
-    rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
-
-    covered_tot = float(covered_by_row.sum())
-    cap_tot = float(capacity.sum())
-    total_dict = {                                                     
-        "n_blocks": int(n_blocks.sum()),
-        "demand": total_demand,
-        "covered_demand": covered_tot,
-        "missed_demand": max(total_demand - covered_tot, 0.0),
-        "idle_capacity": cap_tot - covered_tot,
-        "coverage": safe(covered_tot, total_demand),
-        "objective": covered_tot - theta * cap_tot,
-    }   
-    return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total_dict))
+    theta_r = np.broadcast_to(np.asarray(theta, dtype=np.float64), (D.shape[0],))
+    blocks = _block_records(D, sols, time_values, fixed_length=int(L))
+    return _report_from_blocks(D, blocks, D.shape[0], theta_r, row_labels)
 
 # ---------------------------------------------------------------------------
 # multi lengths algorithm
@@ -810,74 +804,18 @@ def coverage_report_multi(D, sols, time_values, theta, row_labels=None) -> Cover
 
     D    : (n_rows, T) demand grid in [0, 1] (not padded: the overhang bins have zero demand)
     sols : list of MultiSolution for the first len(sols) rows (the rows with a server); the remaining
-           rows have no server: demand with 0 blocks, 0 coverage
+           rows have no server: demand with 0 blocks
     time_values : (T,) datetime-like, start time of each bin
-    theta : the theta used to compute the solutions: a number or one value per row of D (None = no objective).
+    theta : the theta used to compute the solutions: a number or one value per row of D (None = 0).
             objective = covered demand - theta * capacity of the blocks
     """
     D = np.asarray(D, dtype=np.float64)
     if len(sols) > D.shape[0]:
         raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
-    if theta is not None:
-        theta_array = np.asarray(theta, dtype=np.float64)
-        if theta_array.ndim > 1 or (theta_array.ndim == 1 and theta_array.size != np.shape(D)[0]) \
-                or not np.isfinite(theta_array).all() or (theta_array < 0).any() or (theta_array > 1).any():
-            raise ValueError("theta must be a number in [0, 1] or one such value per row of D")
-
-    theta_r = np.broadcast_to(np.asarray(0.0 if theta is None else theta, dtype=np.float64), (D.shape[0],))
-
-    row_demand = D.sum(axis=1)
-    total_demand = float(D.sum())
-    safe = lambda num, den: num / den if den > 0 else np.nan
-
-    tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
-    step = tv.iloc[1] - tv.iloc[0]
-
-    recs = []
-    for c, sol in enumerate(sols):
-        for b, (s0, l) in enumerate(zip(sol.starts, sol.lengths)):
-            s0, l = int(s0), int(l)
-            covered = float(D[c, s0:s0 + l].sum())
-            rec = dict(row=c, block=b, length=l, start_slot=s0, end_slot=s0 + l,
-                       start_time=tv.iloc[s0], end_time=tv.iloc[s0] + l * step,
-                       covered_demand=covered, idle_capacity=l - covered, utilization=covered / l,
-                       objective=covered - theta_r[c] * l)
-        
-            recs.append(rec)
-    blocks = pd.DataFrame(recs)
-    if blocks.empty:
-        cols = ["row", "block", "length", "start_slot", "end_slot", "covered_demand", "idle_capacity", "utilization", "objective"]
-        blocks = pd.DataFrame(columns=cols)
-
-    n_rows = D.shape[0]
-    by_row = lambda col, fill: blocks.groupby("row")[col].sum().reindex(range(n_rows), fill_value=fill).to_numpy()
-    covered_by_row = by_row("covered_demand", 0.0).astype(float)
-    capacity = by_row("length", 0).astype(float)
-    n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0).to_numpy()
-
-    rows = pd.DataFrame({
-        "n_blocks": n_blocks,
-        "demand": row_demand,
-        "covered_demand": covered_by_row,
-        "missed_demand": np.clip(row_demand - covered_by_row, 0.0, None),
-        "idle_capacity": capacity - covered_by_row,
-        "coverage": [safe(cv, dm) for cv, dm in zip(covered_by_row, row_demand)],
-        "utilization": [safe(cv, cp) for cv, cp in zip(covered_by_row, capacity)],
-        "objective": covered_by_row - theta_r * capacity,
-    }).rename_axis("row")
-
-    rows.insert(0, "server", list(row_labels) if row_labels is not None else [None] * n_rows)
-
-    covered_tot, cap_tot = float(covered_by_row.sum()), float(capacity.sum())
-    total = {
-        "n_blocks": int(n_blocks.sum()),
-        "demand": total_demand,
-        "covered_demand": covered_tot,
-        "missed_demand": max(total_demand - covered_tot, 0.0),
-        "idle_capacity": cap_tot - covered_tot,
-        "coverage": safe(covered_tot, total_demand),
-        "objective": float((covered_by_row - theta_r * capacity).sum()),
-    }
-    for l, n in blocks.groupby("length").size().items():          # how many shifts of each length
-        total[f"n_blocks_{int(l)}"] = int(n)
-    return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
+    theta_arr = np.asarray(0.0 if theta is None else theta, dtype=np.float64)
+    if theta_arr.ndim > 1 or (theta_arr.ndim == 1 and theta_arr.size != D.shape[0]) \
+            or not np.isfinite(theta_arr).all() or (theta_arr < 0).any() or (theta_arr > 1).any():
+        raise ValueError("theta must be a number in [0, 1] or one such value per row of D")
+    theta_r = np.broadcast_to(theta_arr, (D.shape[0],))
+    blocks = _block_records(D, sols, time_values)
+    return _report_from_blocks(D, blocks, D.shape[0], theta_r, row_labels)
