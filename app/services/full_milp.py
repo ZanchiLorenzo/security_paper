@@ -34,7 +34,7 @@ from typing import Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 import pyomo.environ as pyo                                            
-from app.services.coverage_dp import MultiSolution, MultiAllocation, coverage_report_multi, _normalize_lengths
+from app.services.coverage_dp import MultiSolution, MultiAllocation, coverage_report_multi, effective_grid, _normalize_lengths
 
 # helpers
 def fluid_cost(arrivals, capacity, bin_minutes):
@@ -110,7 +110,7 @@ def solve_fluid_milp(
     """
     arrivals       : (T,) pax per bin of one day, or (N, T) for N days (queues do not carry over between days)
     rates          : pax per bin of each lane: dict {label: rate} (planner.rate_by_label) or a sequence aligned with labels
-    labels         : lane labels in priority order; the lanes are labels[:] (pass labels[:n_usable] to match run_multi)
+    labels         : lane labels in priority order; the lanes are labels[:] (pass labels[:n_usable] to match run)
     lengths        : allowed window lengths in bins (e.g. lengths_cells)
     bin_minutes    : bin length (minutes)
     K_total        : max number of windows over all lanes and days (None = no limit)
@@ -297,14 +297,14 @@ def solve_fluid_milp(
     return sols, info
 
 
-# planner level (same shape as SecurityPlanner.run_multi)
+# planner level (same shape as SecurityPlanner.run)
 def run_fluid_milp(planner, lengths, K_total, length_totals=None, unserved_tol=1e-3, n_lanes=None,
                    time_limit=None, mip_gap=0.0, symmetry_breaking=True, pack_lanes=True, prefix_lanes=False):
     """
-    Queue-optimal counterpart of planner.run_multi(lengths, theta, K_total, length_totals): same arguments (lengths in
+    Queue-optimal counterpart of planner.run(lengths, theta, K_total, length_totals): same arguments (lengths in
     hours; K_total is an upper bound, fewer windows may be used), objective lexicographic (unserved, then wait), same PlannerResults (schedule, df_curves, coverage, report in planner.report). theta is not used: the result
     has theta=0 and theta_rows=0, so its `objective` is the covered demand. Returns (PlannerResults, info).
-    n_lanes : number of lanes (default: the same as run_multi, min(demand layers, servers)).
+    n_lanes : number of lanes (default: the same as run, min(demand layers, servers)).
     """
     try:
         from app.services.security_class import PlannerResults
@@ -331,14 +331,17 @@ def run_fluid_milp(planner, lengths, K_total, length_totals=None, unserved_tol=1
 
     zeros = np.zeros(n_rows)
     row_labels = labels + ["no server"] * (n_rows - n_usable)
-    planner.report = coverage_report_multi(D=planner.demand_grid, sols=sols, time_values=planner.time_values,
-                                           row_labels=row_labels, theta=zeros)
+    D_eff = effective_grid(planner.demand_grid, [s.coverage for s in sols])
+    rep = coverage_report_multi(D=planner.demand_grid, sols=sols, time_values=planner.time_values,
+                                row_labels=row_labels, theta=zeros, D_cov=D_eff)
     schedule, df_curves = planner._schedule_and_curves(sols, labels)
+    cov_slot = float(np.minimum(df_curves["demand"], df_curves["processing"]).sum() / df_curves["demand"].sum())
+    total = rep.total.copy(); total["coverage_slot"] = cov_slot
+    planner.report = type(rep)(blocks=rep.blocks, rows=rep.rows, total=total)
     planner.results = PlannerResults(
-        L=lengths_h[-1], L_cells=lengths_cells[-1], theta=0.0, K_total=int(K_total), bin_minutes=planner.bin_minutes,
-        demand_grid=planner.demand_grid, server_labels=tuple(labels), server_schedule=schedule, df_curves=df_curves,
-        coverage=planner.report.total.coverage,
-        lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), length_totals=length_totals,
-        theta_rows=tuple(0.0 for _ in labels),
-        coverage_slot=float(np.minimum(df_curves["demand"], df_curves["processing"]).sum() / df_curves["demand"].sum()))
+        lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), theta=0.0, theta_rows=tuple(0.0 for _ in labels),
+        K_total=int(K_total), length_totals=length_totals, bin_minutes=planner.bin_minutes,
+        demand_grid=planner.demand_grid, demand_grid_eff=D_eff, server_labels=tuple(labels),
+        server_schedule=schedule, df_curves=df_curves,
+        coverage=float(rep.total["coverage"]), coverage_slot=cov_slot)
     return planner.results, info

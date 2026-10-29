@@ -1,19 +1,493 @@
+"""
+Coverage DP and budget allocation for the lane opening windows.
+ 
+Pipeline (several window lengths: the one SecurityPlanner.run_multi uses). 
+D is the demand grid (rows, T), row r = r-th lane, values in [0, 1]:
+ 
+    solve_coverage_batch_multi   value curve V_r(k) of every row (DP, all rows at once)
+    allocate_milp                how many windows of each length every row gets (MILP over the curves)
+    solve_allocated_multi        where the windows of every row are (DP + backtracking, rows in order)
+    coverage_report_multi        blocks / rows / total tables
+ 
+A window of length l starting in slot s is worth  sum_t (d_t - theta)  over its slots: the demand it covers minus theta for
+every slot in which the lane is open (theta = minimum utilization that justifies opening it). 
+Everything uses lengths in bins.
+"""
 import heapq
-import itertools
+import logging
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
+ 
 import numpy as np
 import pandas as pd
 import pyomo.environ as pyo
-import logging
-
+ 
 TIE_EPS = 1e-9
 
-# utilities
+# data classes
+@dataclass
+class MultiSolution:
+    """Windows chosen on one row: starts (sorted), length of each, and the slots they cover."""
+    value: float                  # optimal objective of the row: covered - theta * capacity
+    starts: np.ndarray            # sorted start slots of the windows
+    lengths: np.ndarray           # length of each window, same order as starts
+    coverage: np.ndarray          # bool[T]: slots in which the row is open
+    inside: float = field(init=False, default=0.0)    # served demand:      sum(d * cov)
+    outside: float = field(init=False, default=0.0)   # idle capacity paid: sum((1 - d) * cov)
+    missed: float = field(init=False, default=0.0)    # demand uncovered:   sum(d * ~cov)
+ 
+    @property
+    def n_rects(self) -> int:
+        return int(len(self.starts))
+ 
+    @property
+    def rects_by_length(self) -> dict:
+        return {int(l): int((self.lengths == l).sum()) for l in np.unique(self.lengths)}
+ 
+    def _fill_stats(self, demand: np.ndarray) -> "MultiSolution":
+        d = np.asarray(demand, dtype=np.float64)
+        self.inside = float(d[self.coverage].sum())
+        self.outside = float((1.0 - d)[self.coverage].sum())
+        self.missed = float(d[~self.coverage].sum())
+        return self
+ 
+@dataclass
+class MultiAllocation:
+    k: np.ndarray                 # int[N, m]: windows of lengths[j] given to row i
+    lengths: list                 # length values = columns of k = trailing axes of the curves
+    value: float                  # total objective, summed across rows
+    per_row_value: np.ndarray     # float[N]
+ 
+    @property
+    def n_total(self) -> int:
+        return int(self.k.sum())
+ 
+    @property
+    def by_length(self) -> dict:
+        return {l: int(self.k[:, j].sum()) for j, l in enumerate(self.lengths)}
+ 
+@dataclass
+class CoverageReport:
+    blocks: pd.DataFrame          # one line per window
+    rows: pd.DataFrame            # one line per row
+    total: pd.Series              # whole day(s)
+ 
+# helpers
 def _check_demand_range(d: np.ndarray) -> None:
-    """Demand is a load in [0, 1]: 1 = slot saturates the row, 0 = nobody needs it."""
+    """Demand is a load in [0, 1]: 1 = the slot saturates the row, 0 = nobody needs it."""
     if d.size and (d.min() < -TIE_EPS or d.max() > 1.0 + TIE_EPS):
-        raise ValueError(f"demand must lie in [0, 1]")
+        raise ValueError("demand must lie in [0, 1]")
+ 
+def _normalize_lengths(lengths: Sequence[int]) -> list:
+    ls = sorted({int(l) for l in lengths})
+    if not ls:
+        raise ValueError("lengths must be non-empty")
+    if ls[0] < 1:
+        raise ValueError(f"every length must be >= 1, got {ls}")
+    return ls
+ 
+def _theta_rows(theta, n_rows: int) -> np.ndarray:
+    """theta (None = 0, a number, or one value per row) -> float array (n_rows,), checked to lie in [0, 1]."""
+    th = np.asarray(0.0 if theta is None else theta, dtype=np.float64)
+    if th.ndim > 1 or (th.ndim == 1 and th.size != n_rows) or not np.isfinite(th).all() or (th < 0).any() or (th > 1).any():
+        raise ValueError("theta must be a number in [0, 1] or one such value per row")
+    return np.broadcast_to(th, (n_rows,))
+ 
+def _prepare(D: np.ndarray, lengths: Sequence[int]):
+    """
+    Prepare the data for the coverage DP.
+    Returns sorted lengths, T, valid starts per length, cap of every length.
+    """
+    lengths = _normalize_lengths(lengths)
+    T = D.shape[1]
+    if lengths[-1] > T:
+        raise ValueError(f"need every length <= T, got {lengths[-1]} > {T}")
+
+    n_starts = [T - l + 1 for l in lengths]
+    caps = [T // l for l in lengths] # how many windows of each length fit in a row
+    return D, lengths, T, n_starts, caps
+ 
+def _window_values(D: np.ndarray, lengths: list, theta_rows: np.ndarray, n_starts: list) -> list:
+    """W[i][r, s] = value of a window of lengths[i] starting at s on row r:  sum_t (d - theta_r)  (prefix sums)."""
+    score = D - theta_rows[:, None]
+    csum = np.concatenate([np.zeros((D.shape[0], 1)), np.cumsum(score, axis=1)], axis=1)
+    return [csum[:, l:l + n] - csum[:, :n] for l, n in zip(lengths, n_starts)]
+ 
+def _axis_slices(m: int, i: int, lead: int = 0):
+    """Slices that align k_i (destination) with k_i - 1 (source) along axis i of the state."""
+    pre = (slice(None),) * lead
+    src = pre + tuple(slice(None, -1) if j == i else slice(None) for j in range(m))
+    dst = pre + tuple(slice(1, None) if j == i else slice(None) for j in range(m))
+    return src, dst
+ 
+def _check_state_space(cells: int, what: str, limit: int) -> None:
+    if cells > limit:
+        raise ValueError(f"{what}: state space is ~{cells:,} cells, over the {limit:,} guard. It grows multiplicatively "
+                         f"with the number of lengths: use fewer lengths")
+ 
+def _solve_with_highs(model, time_limit: Optional[float]) -> None:
+    """Solve a Pyomo MILP with HiGHS; stops at time_limit seconds if given."""
+    opt = pyo.SolverFactory("appsi_highs")
+    opt.config.stream_solver = False
+    opt.config.mip_gap = 0.0
+    opt.highs_options["output_flag"] = False
+    if time_limit:
+        opt.config.time_limit = float(time_limit)
+        opt.highs_options["time_limit"] = float(time_limit)
+    quiet = logging.getLogger("highs_quiet")
+    quiet.setLevel(logging.CRITICAL)
+    opt.config.solver_output_logger = quiet
+    res = opt.solve(model)
+    tc = getattr(res, "termination_condition", None)
+    if tc is not None and tc not in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.maxTimeLimit):
+        raise RuntimeError(f"MILP failed: {tc}")
+ 
+# DP on one row, and on many rows at once
+def solve_coverage_multi(
+    demand: Sequence[float] | np.ndarray,
+    lengths: Sequence[int],
+    theta: float,
+    max_rects: Optional[dict] = None
+) -> MultiSolution:
+    """
+    Exact DP on one row: place disjoint windows of the given lengths, maximizing the sum of their values.
+ 
+    F[t, k_1..k_m] = best objective using slots [0, t) with at most k_i windows of lengths[i]:
+ 
+        F[t, k] = max( F[t-1, k],                                      # no window ends at t
+                       F[t-l_i, k - e_i] + w_i[t-l_i]  for each i )    # a window of length l_i ends at t
+ 
+    Ties go to not placing a window, so a window of value <= 0 is never used.
+    max_rects : {length: cap} on the windows of each length (default: as many as fit); used by solve_allocated_multi.
+    """
+    d = np.asarray(demand, dtype=np.float64)
+    if d.ndim != 1:
+        raise ValueError("demand must be 1-D; use solve_coverage_batch_multi for many rows")
+    _check_demand_range(d)
+    D, lengths, T, n_starts, caps = _prepare(d[None, :], lengths)
+ 
+    if max_rects is not None:
+        unknown = set(max_rects) - set(lengths)
+        if unknown:
+            raise ValueError(f"max_rects has lengths {sorted(unknown)} that are not in lengths={lengths}")
+        caps = [max(0, min(c, int(max_rects.get(l, c)))) for l, c in zip(lengths, caps)]
+ 
+    m = len(lengths)
+    shape = tuple(c + 1 for c in caps)
+    _check_state_space(T * int(np.prod(shape)), "solve_coverage_multi", limit=20_000_000)
+ 
+    if all(c == 0 for c in caps):
+        empty = np.empty(0, dtype=int)
+        return MultiSolution(0.0, empty, empty, np.zeros(T, dtype=bool))._fill_stats(D[0])
+ 
+    W = _window_values(D, lengths, _theta_rows(theta, 1), n_starts)
+    F = np.zeros((T + 1,) + shape, dtype=np.float64)
+    take = np.full((T + 1,) + shape, -1, dtype=np.int8)   # index of the length ending a window at t, -1 = carry F[t-1]
+    moves = [(i, l, *_axis_slices(m, i)) for i, l in enumerate(lengths) if caps[i] > 0]
+ 
+    for t in range(1, T + 1):
+        F[t] = F[t - 1]
+        for i, l, src, dst in moves:
+            if t < l or t - l >= n_starts[i]:
+                continue
+            cand = F[t - l][src] + W[i][0, t - l]
+            cur = F[t][dst]                                   # views: writing into them updates F[t] / take[t]
+            better = cand > cur
+            if better.any():
+                cur[better] = cand[better]
+                take[t][dst][better] = i
+ 
+    # backtrack from the final state (T, caps)
+    starts, lens = [], []
+    state, t = list(caps), T
+    while t > 0:
+        i = int(take[(t,) + tuple(state)])
+        if i < 0:
+            t -= 1
+        else:
+            starts.append(t - lengths[i])
+            lens.append(lengths[i])
+            t -= lengths[i]
+            state[i] -= 1
+    starts.reverse()
+    lens.reverse()
+ 
+    coverage = np.zeros(T, dtype=bool)
+    for s, l in zip(starts, lens):
+        coverage[s:s + l] = True
+    value = float(F[(T,) + tuple(caps)])
+    return MultiSolution(value, np.asarray(starts, dtype=int), np.asarray(lens, dtype=int), coverage)._fill_stats(D[0])
+ 
+def solve_coverage_batch_multi(
+    demand: np.ndarray,
+    lengths: Sequence[int],
+    theta: Union[float, Sequence[float]]
+) -> np.ndarray:
+    """
+    Value curves of many rows at once. demand (N, T); theta: a number or one value per row.
+    Returns (N, K_1+1, .., K_m+1), lengths sorted ascending: entry [r, k_1, .., k_m] is the best value of row r using
+    at most k_i windows of lengths[i], for every i at once. This is the input of allocate_milp.
+    """
+    D = np.asarray(demand, dtype=np.float64)
+    if D.ndim != 2:
+        raise ValueError("demand must be (N, T)")
+    _check_demand_range(D)
+    theta_rows = _theta_rows(theta, D.shape[0])
+    D, lengths, T, n_starts, caps = _prepare(D, lengths)
+    N, m = D.shape[0], len(lengths)
+    shape = tuple(c + 1 for c in caps)
+    P = lengths[-1] + 1                                       # ring buffer: only F[t-l], l <= max length, is needed
+    _check_state_space(P * N * int(np.prod(shape)), "solve_coverage_batch_multi", limit=50_000_000)
+ 
+    if all(c == 0 for c in caps):
+        return np.zeros((N,) + shape)
+ 
+    W = _window_values(D, lengths, theta_rows, n_starts)
+    moves = [(i, l, *_axis_slices(m, i, lead=1)) for i, l in enumerate(lengths) if caps[i] > 0]
+ 
+    buf = np.zeros((P, N) + shape, dtype=np.float64)          # buf[t % P] holds F[t]
+    for t in range(1, T + 1):
+        cur = buf[t % P]
+        cur[...] = buf[(t - 1) % P]
+        for i, l, src, dst in moves:
+            if t < l or t - l >= n_starts[i]:
+                continue
+            wv = W[i][:, t - l].reshape((N,) + (1,) * m)
+            view = cur[dst]
+            np.maximum(view, buf[(t - l) % P][src] + wv, out=view)
+    return buf[T % P].copy()
+
+# budget allocation (MILP over the value curves)
+def allocate_milp(
+    curves: np.ndarray,
+    lengths: Sequence[int],
+    n_days: int = 1,
+    n_layers: Optional[int] = None,
+    K_total: Optional[int] = None,
+    length_per_day: Optional[dict] = None,
+    K_day: Optional[Union[int, dict, Sequence[int]]] = None,
+    time_limit: Optional[float] = None,
+) -> MultiAllocation:
+    """
+    Decide how many windows of each length every row gets, maximizing the total value of the rows:
+ 
+        max  sum_{n,r} sum_{k in K*[n,r]} V[n,r,k] z[n,r,k]
+        s.t. sum_{k in K*[n,r]} z[n,r,k] = 1                    for every day n, layer r   (one state per row)
+             sum_{n,r,k} |k|   z[n,r,k] <= K_total              (optional)
+             sum_{r,k}   |k|   z[n,r,k] <= K_day[n]             for every day n (optional)
+             sum_{r,k}   k_j   z[n,r,k] <= length_per_day[l_j]  for every day n and length j (optional)
+ 
+    K*[n,r] = efficient states of the row: V(k) > V(k - e_j) for every j with k_j >= 1 (budgets are upper bounds, so a
+    state that does not improve on a smaller one is never needed).
+ 
+    curves         : (n_days * n_layers, K_1+1, .., K_m+1) from solve_coverage_batch_multi, rows ordered day by day:
+                     row = n * n_layers + r
+    n_days         : number of days (default 1: the rows of curves are the layers of a single day)
+    n_layers       : layers per day (default curves.shape[0] // n_days)
+    K_day          : int (same for all days), dict {n: cap} or sequence indexed by n; a day missing from a dict = no limit
+    length_per_day : {length: max windows of that length on each day}, the same cap for every day
+    Returns MultiAllocation with one row of k per (n, r), in the order of curves.
+    """
+    curves = np.asarray(curves, dtype=np.float64)
+    lengths = _normalize_lengths(lengths)
+    m_len = len(lengths)
+    if n_layers is None:
+        if curves.shape[0] % n_days:
+            raise ValueError(f"curves has {curves.shape[0]} rows, not a multiple of n_days={n_days}")
+        n_layers = curves.shape[0] // n_days
+    if curves.ndim != m_len + 1:
+        raise ValueError(f"curves must have {m_len + 1} axes; got {curves.shape}")
+    if curves.shape[0] != n_days * n_layers:
+        raise ValueError(f"curves has {curves.shape[0]} rows, expected n_days * n_layers = {n_days * n_layers}")
+    length_per_day = length_per_day or {}
+    unknown = set(length_per_day) - set(lengths)
+    if unknown:
+        raise ValueError(f"length_per_day has lengths {sorted(unknown)} that are not in lengths={lengths}")
+ 
+    # efficient states: removing any window of the state must lower the value
+    efficient = np.ones(curves.shape, dtype=bool)
+    for j in range(m_len):
+        hi = [slice(None)] * curves.ndim; hi[1 + j] = slice(1, None)
+        lo = [slice(None)] * curves.ndim; lo[1 + j] = slice(0, -1)
+        gain = np.full(curves.shape, np.inf)                  # k_j = 0: nothing to remove
+        gain[tuple(hi)] = curves[tuple(hi)] - curves[tuple(lo)]
+        efficient &= gain > TIE_EPS
+    cells = [(n, r) for n in range(n_days) for r in range(n_layers)]
+    states = {(n, r): [tuple(int(x) for x in s) for s in np.argwhere(efficient[n * n_layers + r])] for n, r in cells}
+    V = lambda n, r, kap: float(curves[(n * n_layers + r,) + kap])
+ 
+    if K_day is None:
+        day_cap = [None] * n_days
+    elif isinstance(K_day, dict):
+        day_cap = [K_day.get(n) for n in range(n_days)]
+    elif np.isscalar(K_day):
+        day_cap = [K_day] * n_days
+    else:
+        day_cap = list(K_day)
+ 
+    m = pyo.ConcreteModel()
+    m.I = pyo.Set(initialize=[(n, r) + kap for (n, r) in cells for kap in states[n, r]], dimen=m_len + 2)
+    m.z = pyo.Var(m.I, domain=pyo.Binary)                     # z[n, r, k_1, .., k_m]: row (n, r) takes state k
+    m.obj = pyo.Objective(expr=sum(V(n, r, kap) * m.z[(n, r) + kap] for (n, r) in cells for kap in states[n, r]),
+                          sense=pyo.maximize)
+ 
+    m.one = pyo.ConstraintList()
+    for n, r in cells:
+        m.one.add(sum(m.z[(n, r) + kap] for kap in states[n, r]) == 1)
+    if K_total is not None:
+        m.total = pyo.Constraint(expr=sum(sum(kap) * m.z[(n, r) + kap] for (n, r) in cells for kap in states[n, r])
+                                 <= max(0, int(K_total)))
+    m.per_day = pyo.ConstraintList()
+    for n in range(n_days):
+        rows_n = [(r, kap) for r in range(n_layers) for kap in states[n, r]]
+        if day_cap[n] is not None:
+            m.per_day.add(sum(sum(kap) * m.z[(n, r) + kap] for r, kap in rows_n) <= max(0, int(day_cap[n])))
+        for j, l in enumerate(lengths):
+            if l in length_per_day:
+                m.per_day.add(sum(kap[j] * m.z[(n, r) + kap] for r, kap in rows_n) <= max(0, int(length_per_day[l])))
+ 
+    _solve_with_highs(m, time_limit)
+ 
+    k = np.zeros((n_days * n_layers, m_len), dtype=int)
+    for n, r in cells:
+        k[n * n_layers + r] = max(states[n, r], key=lambda s: pyo.value(m.z[(n, r) + s]))
+    per_row_value = np.array([curves[(i,) + tuple(k[i])] for i in range(len(k))])
+    return MultiAllocation(k=k, lengths=lengths, value=float(per_row_value.sum()), per_row_value=per_row_value)
+ 
+# positions of the windows: re-solve every row with its own k
+def _inherited_row(rho: np.ndarray, n_open: np.ndarray) -> np.ndarray:
+    """Demand a row sees when n_open lower rows are open in each slot: clip(rho - n_open, 0, 1)."""
+    return np.clip(rho - n_open, 0.0, 1.0)
+ 
+def effective_grid(D: np.ndarray, coverages: Sequence) -> np.ndarray:
+    """
+    Demand each row sees when it inherits what the rows below left uncovered.
+    D (n_rows, T): layers, rows sum to rho_t = arrivals / pax per lane-bin. coverages[r] = bool mask of the slots in which
+    row r is open (rows beyond len(coverages) have no server). Row r sees clip(rho_t - n_t, 0, 1), n_t = number of rows
+    < r open in slot t: if all the lower rows are open it is the usual layer r; if some are closed, their uncovered
+    demand falls on row r. Then  sum_r covered demand of row r = sum_t min(a_t, capacity_t): the true coverage.
+    """
+    D = np.asarray(D, dtype=np.float64)
+    T = D.shape[1]
+    rho = D.sum(axis=0)
+    n_open = np.zeros(T)
+    out = np.empty_like(D)
+    for r in range(D.shape[0]):
+        out[r] = _inherited_row(rho, n_open)
+        if r < len(coverages):
+            n_open += np.asarray(coverages[r], dtype=bool)[:T]
+    return out
+ 
+def solve_allocated_multi(
+    demand: np.ndarray,
+    theta: Union[float, Sequence[float]],
+    alloc: MultiAllocation,
+    inherit: bool = True,
+) -> list:
+    """
+    Recover the windows of every row, each with its own number of windows per length (alloc.k). 
+    Fewer windows than alloc.k may be placed (a window with value <= 0 is not opened):
+    count them with sol.n_rects / sol.rects_by_length.
+ 
+    inherit=True: rows are solved in order, row r on the demand rows 0..r-1 left uncovered (see effective_grid), so its
+    windows can fill the slots where a lower row is closed. alloc.k comes from the plain layers. For the true coverage, row
+    r is never worse than on its plain layer, which is still a feasible choice.
+    """
+    D = np.asarray(demand, dtype=np.float64)
+    if D.ndim != 2:
+        raise ValueError("demand must be (N, T)")
+    if alloc.k.shape[0] != D.shape[0]:
+        raise ValueError(f"alloc has {alloc.k.shape[0]} rows, demand has {D.shape[0]}")
+    theta_rows = _theta_rows(theta, D.shape[0])
+ 
+    rho = D.sum(axis=0)
+    n_open = np.zeros(D.shape[1])
+    sols = []
+    for r in range(D.shape[0]):
+        row = _inherited_row(rho, n_open) if inherit else D[r]
+        sol = solve_coverage_multi(row, alloc.lengths, float(theta_rows[r]),
+                                   max_rects={l: int(alloc.k[r, j]) for j, l in enumerate(alloc.lengths)},
+                                )
+        sols.append(sol)
+        n_open += sol.coverage[:D.shape[1]]
+    return sols
+ 
+# report
+_BLOCK_COLS = ["row", "block", "length", "start_slot", "start_time", "end_time", "covered_demand", "utilization"]
+ 
+def _block_records(D, sols, time_values, fixed_length=None) -> pd.DataFrame:
+    """One line per window: where it is, how long, how much demand it covers, how busy it is."""
+    tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
+    step = tv.iloc[1] - tv.iloc[0]
+    recs = []
+    for c, sol in enumerate(sols):
+        lengths = [fixed_length] * len(sol.starts) if fixed_length is not None else sol.lengths
+        for b, (s0, l) in enumerate(zip(sol.starts, lengths)):
+            s0, l = int(s0), int(l)
+            covered = float(D[c, s0:s0 + l].sum())
+            recs.append(dict(row=c, block=b, length=l, start_slot=s0, start_time=tv.iloc[s0],
+                             end_time=tv.iloc[s0] + l * step, covered_demand=covered, utilization=covered / l))
+    return pd.DataFrame(recs, columns=_BLOCK_COLS)
+ 
+def _report_from_blocks(D, blocks, theta_rows, row_labels) -> CoverageReport:
+    """Per-row and total tables from the block table. D (n_rows, T) gives the demand of the rows."""
+    n_rows = D.shape[0]
+    row_demand = D.sum(axis=1)
+    safe = lambda num, den: num / den if den > 0 else np.nan
+    by_row = lambda col: blocks.groupby("row")[col].sum().reindex(range(n_rows), fill_value=0).to_numpy().astype(float)
+    covered, capacity = by_row("covered_demand"), by_row("length")
+    n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0).to_numpy()
+    
+    rows = pd.DataFrame({
+        "server": list(row_labels) if row_labels is not None else [None] * n_rows,
+        "n_blocks": n_blocks,
+        "demand": row_demand,
+        "covered_demand": covered,
+        "coverage": [safe(cv, dm) for cv, dm in zip(covered, row_demand)],
+    }).rename_axis("row")
+ 
+    total = {
+        "n_blocks": int(n_blocks.sum()),
+        "demand": float(row_demand.sum()),
+        "covered_demand": float(covered.sum()),
+        "coverage": safe(float(covered.sum()), float(row_demand.sum())),
+        "objective": float((covered - theta_rows * capacity).sum()),    # sum of (covered - theta * length)
+    }
+    for l, n in blocks.groupby("length").size().items():                 # how many windows of each length
+        total[f"n_blocks_{int(l)}"] = int(n)
+    return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
+ 
+def coverage_report_multi(D, sols, time_values, theta, row_labels=None, D_cov=None) -> CoverageReport:
+    """
+    Report of the DP solution.
+ 
+    D    : (n_rows, T) demand grid in [0, 1]
+    sols : list of MultiSolution for the first len(sols) rows (the rows with a server); the other rows of D have no
+           server: demand with 0 blocks
+    time_values : (T,) datetime-like, start time of each bin
+    theta : the theta used to compute the solutions: a number or one value per row of D (None = 0)
+    D_cov : demand grid the rows were solved on when they inherit uncovered demand (effective_grid); the covered demand
+            of the blocks is read from it. Default D (rows independent). Demand and coverage of rows / total stay relative to D.
+ 
+    blocks : row, block, length, start_slot, start_time, end_time, covered_demand, utilization
+    rows   : server, n_blocks, demand, covered_demand, coverage
+    total  : n_blocks, n_blocks_<length>, demand, covered_demand, coverage, objective = sum(covered - theta * length)
+    """
+    D = np.asarray(D, dtype=np.float64)
+    if len(sols) > D.shape[0]:
+        raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
+    theta_rows = _theta_rows(theta, D.shape[0])
+    blocks = _block_records(D if D_cov is None else np.asarray(D_cov, dtype=np.float64), sols, time_values)
+    return _report_from_blocks(D, blocks, theta_rows, row_labels)
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# single L algorithm
 
 def extend_demand(demand: np.ndarray, L: int) -> np.ndarray:
     """
@@ -25,8 +499,6 @@ def extend_demand(demand: np.ndarray, L: int) -> np.ndarray:
     width = [(0, 0)] * (d.ndim - 1) + [(0, L - 1)]
     return np.pad(d, width)
 
-# ---------------------------------------------------------------------------
-# single L algorithm
 @dataclass
 class Solution:
     value: float                 # optimal objective = inside - theta * (inside + outside)
@@ -289,533 +761,3 @@ def solve_allocated(
         raise ValueError(f"alloc has {len(alloc.k)} rows, demand has {D.shape[0]}")
     return [solve_coverage(row, L, theta, max_rects=int(k), allow_overhang=allow_overhang)
             for row, k in zip(D, alloc.k)]
-
-@dataclass
-class CoverageReport:
-    blocks: pd.DataFrame
-    rows: pd.DataFrame
-    total: pd.Series
-
-def _report_from_blocks(D, blocks, n_rows, theta_r, row_labels) -> CoverageReport:
-    """Generate per-row and total tables from the block table."""
-    row_demand = D.sum(axis=1)
-    safe = lambda num, den: num / den if den > 0 else np.nan
-    by_row = lambda col: blocks.groupby("row")[col].sum().reindex(range(n_rows), fill_value=0).to_numpy().astype(float)
-    covered, capacity = by_row("covered_demand"), by_row("length")
-    n_blocks = blocks.groupby("row").size().reindex(range(n_rows), fill_value=0).to_numpy()
-
-    rows = pd.DataFrame({
-        "server": list(row_labels) if row_labels is not None else [None] * n_rows,
-        "n_blocks": n_blocks,
-        "demand": row_demand,
-        "covered_demand": covered,
-        "coverage": [safe(cv, dm) for cv, dm in zip(covered, row_demand)],
-    }).rename_axis("row")
-
-    total = {
-        "n_blocks": int(n_blocks.sum()),
-        "demand": float(row_demand.sum()),
-        "covered_demand": float(covered.sum()),
-        "coverage": safe(float(covered.sum()), float(row_demand.sum())),
-        "objective": float((covered - theta_r * capacity).sum()),      # sum of (covered - theta * length)
-    }
-    for l, n in blocks.groupby("length").size().items():               # how many blocks of each length
-        total[f"n_blocks_{int(l)}"] = int(n)
-    return CoverageReport(blocks=blocks, rows=rows, total=pd.Series(total))
-
-_BLOCK_COLS = ["row", "block", "length", "start_slot", "start_time", "end_time", "covered_demand", "utilization"]
-
-def _block_records(D, sols, time_values, fixed_length=None) -> pd.DataFrame:
-    """One line per block: where it is, how long, how much demand it covers, how busy it is."""
-    tv = pd.to_datetime(pd.Series(time_values).reset_index(drop=True))
-    step = tv.iloc[1] - tv.iloc[0]
-    recs = []
-    for c, sol in enumerate(sols):
-        lengths = [fixed_length] * len(sol.starts) if fixed_length is not None else sol.lengths
-        for b, (s0, l) in enumerate(zip(sol.starts, lengths)):
-            s0, l = int(s0), int(l)
-            covered = float(D[c, s0:s0 + l].sum())
-            recs.append(dict(row=c, block=b, length=l, start_slot=s0, start_time=tv.iloc[s0],
-                             end_time=tv.iloc[s0] + l * step, covered_demand=covered, utilization=covered / l))
-    return pd.DataFrame(recs, columns=_BLOCK_COLS)
-
-def coverage_report(D, sols, L, time_values, theta, row_labels=None) -> CoverageReport:
-    """
-    Report of the single-length DP solution.
-
-    D    : (n_rows, T) demand grid in [0, 1]
-    sols : list of Solution for the first len(sols) rows (the rows that have a server); the remaining
-           rows of D have no server: demand with 0 blocks
-    L    : shift length in bins
-    time_values : (T,) datetime-like, start time of each bin
-    theta : the theta used to compute the solutions (number, or one value per row)
-
-    blocks : row, block, length, start_slot, start_time, end_time, covered_demand, utilization
-    rows   : server, n_blocks, demand, covered_demand, coverage
-    total  : n_blocks, n_blocks_<L>, demand, covered_demand, coverage, objective = sum(covered - theta * length)
-    """
-    D = np.asarray(D, dtype=np.float64)
-    if len(sols) > D.shape[0]:
-        raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
-    theta_r = np.broadcast_to(np.asarray(theta, dtype=np.float64), (D.shape[0],))
-    blocks = _block_records(D, sols, time_values, fixed_length=int(L))
-    return _report_from_blocks(D, blocks, D.shape[0], theta_r, row_labels)
-
-# ---------------------------------------------------------------------------
-# multi lengths algorithm
-
-Caps = Optional[Union[int, dict]]
-
-@dataclass
-class MultiSolution:
-    """Same as Solution, plus the length of every rectangle."""
-    value: float                  # optimal objective = inside - theta * (inside + outside)
-    starts: np.ndarray            # sorted start indices of the chosen rectangles
-    lengths: np.ndarray           # length of each chosen rectangle, same order as starts
-    coverage: np.ndarray          # bool[T_ext], covered slots
-    n_rects: int = field(init=False)
-    rects_by_length: dict = field(init=False, default_factory=dict)
-    inside: float = field(init=False, default=0.0)    # served demand:      sum(d * cov)
-    outside: float = field(init=False, default=0.0)   # idle capacity paid: sum((1 - d) * cov)
-    missed: float = field(init=False, default=0.0)    # demand uncovered:   sum(d * ~cov)
-
-    def __post_init__(self) -> None:
-        self.n_rects = int(len(self.starts))
-        self.rects_by_length = {}
-        for l in self.lengths.tolist():
-            self.rects_by_length[l] = self.rects_by_length.get(l, 0) + 1
-
-    def _fill_stats(self, demand: np.ndarray) -> "MultiSolution":
-        d = np.asarray(demand, dtype=np.float64)
-        cov = self.coverage
-        self.inside = float(d[cov].sum())
-        self.outside = float((1.0 - d)[cov].sum())
-        self.missed = float(d[~cov].sum())
-        return self
-
-#preprocessing
-def _normalize_lengths(lengths: Sequence[int]) -> list:
-    ls = sorted({int(l) for l in lengths})
-    if not ls:
-        raise ValueError("lengths must be non-empty")
-    if ls[0] < 1:
-        raise ValueError(f"every length must be >= 1, got {ls}")
-    return ls
-
-def _row_caps(T_ext: int, lengths: list) -> list:
-    """Per-row cap of every length: how many fit in the padded horizon."""
-    caps = []
-    for l in lengths:
-        caps.append(T_ext // l)
-    return caps
-
-def _prepare(D: np.ndarray, lengths: Sequence[int], allow_overhang: bool):
-    """D (N, T) -> D_ext (N, T_ext), sorted lengths, T_ext, number of valid starts per length, row caps."""
-    lengths = _normalize_lengths(lengths)
-    T = D.shape[1]
-    if not allow_overhang and lengths[-1] > T:
-        raise ValueError(f"need every length <= T when allow_overhang=False, got {lengths[-1]} > {T}")
-    pad = lengths[-1] - 1 if allow_overhang else 0
-    D_ext = np.pad(D, ((0, 0), (0, pad)))
-    T_ext = T + pad
-    # overhang: a rectangle may start at any real bin (0..T-1); otherwise it must fit in the day
-    n_starts = [T if allow_overhang else T - l + 1 for l in lengths]
-    caps = _row_caps(T_ext, lengths)
-    return D_ext, lengths, T_ext, n_starts, caps
-
-def _window_values(D_ext: np.ndarray, lengths: list, theta, n_starts: list) -> list:
-    """W[i][r, s] = value of a rectangle of lengths[i] starting at s on row r:  sum_t ( d - theta)."""
-    theta_array = np.asarray(theta, dtype=np.float64)
-    if theta_array.ndim == 1:
-        theta_array = theta_array[:, None] 
-    score = D_ext - theta_array
-    csum = np.concatenate([np.zeros((D_ext.shape[0], 1)), np.cumsum(score, axis=1)], axis=1)
-    return [csum[:, l:l + n] - csum[:, :n] for l, n in zip(lengths, n_starts)]
-
-def _axis_slices(m: int, i: int, lead: int = 0):
-    """Slices that align k_i (destination) with k_i - 1 (source) along axis i of the state."""
-    pre = (slice(None),) * lead
-    src = pre + tuple(slice(None, -1) if j == i else slice(None) for j in range(m))
-    dst = pre + tuple(slice(1, None) if j == i else slice(None) for j in range(m))
-    return src, dst
-
-def _check_state_space(cells: int, what: str, limit: int) -> None:
-    if cells > limit:
-        raise ValueError(
-            f"{what}: state space is ~{cells:,} cells, over the {limit:,} guard. It grows multiplicatively "
-            f"with the number of lengths: use fewer lengths"
-        )
-    
-# one row DP
-def solve_coverage_multi(
-    demand: Sequence[float] | np.ndarray,
-    lengths: Sequence[int],
-    theta: float,
-    max_rects: Optional[dict] = None,  # {length: cap}: used by solve_allocated_multi
-    allow_overhang: bool = True,
-) -> MultiSolution:
-    """
-    Exact DP: place rectangles of the given lengths on one demand vector, disjoint from each other, maximizing the objective.
-
-    F[t, k_1..k_m] = best objective using slots [0, t) with at most k_i rectangles of lengths[i]:
-
-        F[t, k] = max( F[t-1, k],                                      # nothing ends at t
-                       F[t-l_i, k - e_i] + w_i[t-l_i]  for each i )    # a rectangle of length l_i ends at t
-
-    Ties go to not placing a rectangle, so a rectangle of value <= 0 is never used.
-    """
-    d = np.asarray(demand, dtype=np.float64)
-    if d.ndim != 1:
-        raise ValueError("demand must be 1-D; use solve_coverage_batch_multi for many rows")
-    _check_demand_range(d)
-    D, lengths, T, n_starts, caps = _prepare(d[None, :], lengths, allow_overhang)
-
-    if max_rects is not None:
-            unknown = set(max_rects) - set(lengths)
-            if unknown:
-                raise ValueError(f"max_rects has lengths {sorted(unknown)} that are not in lengths={lengths}")
-            caps = [max(0, min(c, int(max_rects.get(l, c)))) for l, c in zip(lengths, caps)]
-
-    m = len(lengths)
-    shape = tuple(c + 1 for c in caps)
-    _check_state_space(T * int(np.prod(shape)), "solve_coverage_multi", limit=20_000_000)
-
-    if all(c == 0 for c in caps):
-        cov = np.zeros(T, dtype=bool)
-        return MultiSolution(0.0, np.empty(0, dtype=int), np.empty(0, dtype=int), cov)._fill_stats(D[0])
-
-    W = _window_values(D, lengths, theta, n_starts)
-
-    F = np.zeros((T + 1,) + shape, dtype=np.float64)
-    # take[t][state]: index of the length that ends a rectangle at t in that state, -1 = carry F[t-1]
-    take = np.full((T + 1,) + shape, -1, dtype=np.int8)
-    moves = [(i, l, *_axis_slices(m, i)) for i, l in enumerate(lengths) if caps[i] > 0]
-
-    for t in range(1, T + 1):
-        F[t] = F[t - 1]
-        for i, l, src, dst in moves:
-            if t < l or t - l >= n_starts[i]:
-                continue
-            cand = F[t - l][src] + W[i][0, t - l]
-            cur = F[t][dst]                       # views: writing into them updates F[t] / take[t]
-            better = cand > cur
-            if better.any():
-                cur[better] = cand[better]
-                tk = take[t][dst]
-                tk[better] = i
-
-    # backtrack from the final state (T, caps)
-    starts, starts_len = [], []
-    state = list(caps)
-    t = T
-    while t > 0:
-        i = int(take[(t,) + tuple(state)])
-        if i < 0:
-            t -= 1
-        else:
-            l = lengths[i]
-            starts.append(t - l)
-            starts_len.append(l)
-            t -= l
-            state[i] -= 1
-    starts.reverse()
-    starts_len.reverse()
-
-    coverage = np.zeros(T, dtype=bool)
-    for s, l in zip(starts, starts_len):
-        coverage[s:s + l] = True
-
-    value = float(F[(T,) + tuple(caps)])
-    return MultiSolution(
-        value, np.asarray(starts, dtype=int), np.asarray(starts_len, dtype=int), coverage
-    )._fill_stats(D[0])
-
-# compute values for many rows at once
-def solve_coverage_batch_multi(
-    demand: np.ndarray,
-    lengths: Sequence[int],
-    theta: float,
-    allow_overhang: bool = True,
-) -> np.ndarray:
-    """
-    Compute the best coverage values for multiple rows simultaneously.
-    Returns curves of shape (N, K_1+1, .., K_m+1), lengths sorted ascending: entry [r, k_1, .., k_m] is the
-    best value of row r using at most k_i rectangles of lengths[i], for every i at once.
-    This is the input of allocate_budget_multi
-    """
-    D = np.asarray(demand, dtype=np.float64)
-    if D.ndim != 2:
-        raise ValueError("demand must be (N, T)")
-    _check_demand_range(D)
-    D, lengths, T, n_starts, caps = _prepare(D, lengths, allow_overhang)
-    N, m = D.shape[0], len(lengths)
-    shape = tuple(c + 1 for c in caps)
-    P = lengths[-1] + 1                                   # ring buffer: only F[t-l], l <= max length, is needed
-    _check_state_space(P * N * int(np.prod(shape)), "solve_coverage_batch_multi", limit=50_000_000)
-
-    if all(c == 0 for c in caps):
-        return np.zeros((N,) + shape)
-
-    W = _window_values(D, lengths, theta, n_starts)
-    moves = [(i, l, *_axis_slices(m, i, lead=1)) for i, l in enumerate(lengths) if caps[i] > 0]
-
-    buf = np.zeros((P, N) + shape, dtype=np.float64)      # buf[t % P] holds F[t]
-    for t in range(1, T + 1):
-        cur = buf[t % P]
-        cur[...] = buf[(t - 1) % P]
-        for i, l, src, dst in moves:
-            if t < l or t - l >= n_starts[i]:
-                continue
-            wv = W[i][:, t - l].reshape((N,) + (1,) * m)
-            cand = buf[(t - l) % P][src] + wv
-            view = cur[dst]
-            np.maximum(view, cand, out=view)
-    return buf[T % P].copy()
-
-# pooled-budget allocation (greedy)
-@dataclass
-class MultiAllocation:
-    k: np.ndarray                 # int[N, m]: shifts of lengths[j] given to row i
-    lengths: list                 # length values = columns of k = trailing axes of the curves
-    value: float                  # total objective, summed across rows
-    per_row_value: np.ndarray     # float[N]
-
-    @property
-    def n_total(self) -> int:
-        return int(self.k.sum())
-
-    @property
-    def by_length(self) -> dict:
-        return {l: int(self.k[:, j].sum()) for j, l in enumerate(self.lengths)}
-
-def allocate_budget_multi(
-    curves: np.ndarray,
-    lengths: Sequence[int],
-    K_total: Optional[int] = None,
-    length_totals: Optional[dict] = None,
-) -> MultiAllocation:
-    """
-    Split the shared budget among the rows, greedily.
-
-    curves        : (N, K_1+1, .., K_m+1) from solve_coverage_batch_multi (row-level caps are already inside)
-    lengths       : the same sorted list used to build the curves
-    K_total       : max number of shifts, of any length, across all rows (None = no limit)
-    length_totals : {length: max number of shifts of that length across all rows}; missing = no limit
-
-    One shift at a time goes to the (row, length) whose next increment has the highest marginal gain,
-    stopping when the budget is over, a length is exhausted, or the best gain is not worth taking.
-    Always feasible, not guaranteed optimal: V_r is in general not concave when lengths differ, and the greedy
-    never swaps (e.g. two short shifts -> one long one). An increment that only pays together with another
-    one (gain 0 now, positive after the next) is never found.
-    """
-    curves = np.asarray(curves, dtype=np.float64)
-    lengths = _normalize_lengths(lengths)
-    m = len(lengths)
-    if curves.ndim != m + 1:
-        raise ValueError(f"curves must have {m + 1} axes (N, K_1+1, .., K_{m}+1) for {m} lengths; got {curves.shape}")
-
-    N = curves.shape[0]
-    caps = [s - 1 for s in curves.shape[1:]]
-    length_totals = length_totals or {}
-    unknown = set(length_totals) - set(lengths)
-    if unknown:
-        raise ValueError(f"length_totals has lengths {sorted(unknown)} that are not in lengths={lengths}")
-
-    remaining = [max(0, int(min(length_totals.get(l, N * caps[j]), N * caps[j]))) for j, l in enumerate(lengths)]
-    budget_left = sum(remaining) if K_total is None else max(0, min(int(K_total), sum(remaining)))
-
-    k = np.zeros((N, m), dtype=int)
-    version = [0] * N                     # bumped when row i changes: invalidates its old heap entries
-    heap: list = []
-
-    def push_all(i: int) -> None:
-        version[i] += 1
-        state = tuple(int(x) for x in k[i])
-        base = curves[(i,) + state]
-        for j in range(m):
-            if state[j] < caps[j] and remaining[j] > 0:
-                nxt = state[:j] + (state[j] + 1,) + state[j + 1:]
-                heapq.heappush(heap, (-float(curves[(i,) + nxt] - base), i, j, version[i]))
-
-    for i in range(N):
-        push_all(i)
-
-    while heap and budget_left > 0:
-        neg_gain, i, j, v = heapq.heappop(heap)
-        if v != version[i]:
-            continue                      # stale: row i moved since this entry was pushed
-        if -neg_gain <= TIE_EPS:
-            break                         # the best remaining increment is not worth taking
-        if remaining[j] <= 0:
-            continue                      # this length is exhausted
-        k[i, j] += 1
-        remaining[j] -= 1
-        budget_left -= 1
-        push_all(i)
-
-    per_row_value = np.array([curves[(i,) + tuple(int(x) for x in k[i])] for i in range(N)])
-    return MultiAllocation(k=k, lengths=lengths, value=float(per_row_value.sum()), per_row_value=per_row_value)
-
-# MILP allocation
-def allocate_milp(
-    curves: np.ndarray,
-    lengths: Sequence[int],
-    n_days: int = 1,
-    n_layers: Optional[int] = None,
-    K_total: Optional[int] = None,
-    length_per_day: Optional[dict] = None,
-    K_day: Optional[Union[int, dict, Sequence[int]]] = None,
-    time_limit: Optional[float] = None,
-) -> MultiAllocation:
-    """
-    max  sum_{n,r} sum_{k in K*[n,r]} V[n,r,k] z[n,r,k]
-    s.t. sum_{k in K*[n,r]} z[n,r,k] = 1                    for every day n, layer r
-         sum_{n,r,k} |k|   z[n,r,k] <= K_total              (optional)
-         sum_{r,k}   |k|   z[n,r,k] <= K_day[n]             for every day n (optional)
-         sum_{r,k}   k_j   z[n,r,k] <= length_per_day[l_j]  for every day n and length j (optional)
-    K*[n,r] = efficient states of the row: V(k) > V(k - e_j) for every j with k_j >= 1.
- 
-    n_days : number of days (default 1: the rows of curves are then the layers of a single day)
-    n_layers : layers per day; default = curves.shape[0] // n_days
-    curves : (n_days * n_layers, K_1+1, .., K_m+1), rows ordered day by day: row = n * n_layers + r
-    K_day  : int (same for all days), dict {n: cap} or sequence indexed by n; a day missing from a dict = no limit
-    length_per_day : {length: max number of shifts of that length on each day}, the same cap for every day
-    Days n = 0..n_days-1 and layers r = 0..n_layers-1. Returns the same MultiAllocation as allocate_budget_multi
-    (k has one row per (n, r), in the same order as curves).
-    """
-    curves = np.asarray(curves, dtype=np.float64)
-    lengths = _normalize_lengths(lengths)
-    m_len = len(lengths)
-    if n_layers is None:
-        if curves.shape[0] % n_days:
-            raise ValueError(f"curves has {curves.shape[0]} rows, not a multiple of n_days={n_days}")
-        n_layers = curves.shape[0] // n_days
-    if curves.ndim != m_len + 1:
-        raise ValueError(f"curves must have {m_len + 1} axes; got {curves.shape}")
-    if curves.shape[0] != n_days * n_layers:
-        raise ValueError(f"curves has {curves.shape[0]} rows, expected n_days * n_layers = {n_days * n_layers}")
-    length_per_day = length_per_day or {}
-    unknown = set(length_per_day) - set(lengths)
-    if unknown:
-        raise ValueError(f"length_per_day has lengths {sorted(unknown)} that are not in lengths={lengths}")
- 
-    # efficient states of every row: every window of the state must improve the value
-    eff = np.ones(curves.shape, dtype=bool)
-    for j in range(m_len):
-        ax = 1 + j
-        hi = [slice(None)] * curves.ndim; hi[ax] = slice(1, None)
-        lo = [slice(None)] * curves.ndim; lo[ax] = slice(0, -1)
-        gain = np.full(curves.shape, np.inf)                      # k_j = 0: nothing to remove
-        gain[tuple(hi)] = curves[tuple(hi)] - curves[tuple(lo)]
-        eff &= gain > TIE_EPS
-    states = {}                                                   # (n, r) -> efficient states (tuples)
-    for n in range(n_days):
-        for r in range(n_layers):
-            row = n * n_layers + r
-            states[n, r] = [tuple(int(x) for x in s) for s in np.argwhere(eff[row])]
-    V = {(n, r, kap): float(curves[(n * n_layers + r,) + kap]) for (n, r), ks in states.items() for kap in ks}
- 
-    m = pyo.ConcreteModel()
-    m.N = pyo.RangeSet(0, n_days - 1)                  # days
-    m.R = pyo.RangeSet(0, n_layers - 1)                # layers
-    m.I = pyo.Set(initialize=[(n, r) + kap for (n, r), ks in states.items() for kap in ks], dimen=m_len + 2)
-    m.z = pyo.Var(m.I, domain=pyo.Binary)              # z[n, r, k_1, .., k_m]
- 
-    m.obj = pyo.Objective(
-        expr=sum(V[n, r, kap] * m.z[(n, r) + kap] for (n, r), ks in states.items() for kap in ks),
-        sense=pyo.maximize)
- 
-    m.one = pyo.Constraint(m.N, m.R, rule=lambda m, n, r: sum(m.z[(n, r) + kap] for kap in states[n, r]) == 1)
- 
-    if K_total is not None:
-        m.total = pyo.Constraint(
-            expr=sum(sum(kap) * m.z[(n, r) + kap] for (n, r), ks in states.items() for kap in ks)
-            <= max(0, int(K_total)))
- 
-    if length_per_day:
-        m.JD = pyo.Set(initialize=[j for j, l in enumerate(lengths) if l in length_per_day])
-        m.per_day_length = pyo.Constraint(
-            m.N, m.JD,
-            rule=lambda m, n, j: sum(kap[j] * m.z[(n, r) + kap] for r in m.R for kap in states[n, r])
-            <= max(0, int(length_per_day[lengths[j]])))
- 
-    if K_day is not None:
-        cap_of = (lambda n: K_day.get(n)) if isinstance(K_day, dict) else \
-                 (lambda n: K_day) if np.isscalar(K_day) else (lambda n: K_day[n])
-        m.D = pyo.Set(initialize=[n for n in range(n_days) if cap_of(n) is not None])
-        m.per_day = pyo.Constraint(
-            m.D, rule=lambda m, n: sum(sum(kap) * m.z[(n, r) + kap] for r in m.R for kap in states[n, r])
-            <= max(0, int(cap_of(n))))
- 
-    opt = pyo.SolverFactory("appsi_highs")
-    opt.config.stream_solver = False
-    opt.config.mip_gap = 0.0
-    if time_limit:
-        opt.config.time_limit = float(time_limit)
-    opt.highs_options["output_flag"] = False
-    quiet = logging.getLogger("highs_quiet")
-    quiet.setLevel(logging.CRITICAL)
-    opt.config.solver_output_logger = quiet
-    res = opt.solve(m)
- 
-    if hasattr(res, "termination_condition") and \
-            res.termination_condition not in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.maxTimeLimit):
-        raise RuntimeError(f"MILP failed: {res.termination_condition}")
- 
-    # chosen state of every row (already minimal: only efficient states exist)
-    k = np.zeros((n_days * n_layers, m_len), dtype=int)
-    for n in range(n_days):
-        for r in range(n_layers):
-            kap = max(states[n, r], key=lambda s: pyo.value(m.z[(n, r) + s]))
-            k[n * n_layers + r] = kap
- 
-    per_row_value = np.array([curves[(i,) + tuple(int(x) for x in k[i])] for i in range(len(k))])
-    return MultiAllocation(k=k, lengths=lengths, value=float(per_row_value.sum()), per_row_value=per_row_value)
-
-def solve_allocated_multi(
-    demand: np.ndarray,
-    theta: float,
-    alloc: MultiAllocation,
-    allow_overhang: bool = True,
-) -> list:
-    """
-    Re-solve every row with its own number of shifts per length to recover starts and lengths.
-    Use the same allow_overhang as the curves. The shifts really placed may be fewer than alloc.k:
-    count them with sol.n_rects / sol.rects_by_length.
-    """
-    D = np.asarray(demand, dtype=np.float64)
-    if D.ndim != 2:
-        raise ValueError("demand must be (N, T)")
-    if alloc.k.shape[0] != D.shape[0]:
-        raise ValueError(f"alloc has {alloc.k.shape[0]} rows, demand has {D.shape[0]}")
-
-    theta_rows = np.broadcast_to(np.asarray(theta, dtype=np.float64), (D.shape[0],))
-    return [
-        solve_coverage_multi(row, alloc.lengths, float(th_r),
-                             max_rects={l: int(k_row[j]) for j, l in enumerate(alloc.lengths)},
-                             allow_overhang=allow_overhang)
-        for row, k_row, th_r in zip(D, alloc.k, theta_rows)
-    ]
-
-# report
-def coverage_report_multi(D, sols, time_values, theta, row_labels=None) -> CoverageReport:
-    """
-    Same report as coverage_report, with a length per block.
-
-    D    : (n_rows, T) demand grid in [0, 1] (not padded: the overhang bins have zero demand)
-    sols : list of MultiSolution for the first len(sols) rows (the rows with a server); the remaining
-           rows have no server: demand with 0 blocks
-    time_values : (T,) datetime-like, start time of each bin
-    theta : the theta used to compute the solutions: a number or one value per row of D (None = 0).
-            objective = covered demand - theta * capacity of the blocks
-    """
-    D = np.asarray(D, dtype=np.float64)
-    if len(sols) > D.shape[0]:
-        raise ValueError(f"{len(sols)} solutions for {D.shape[0]} rows")
-    theta_arr = np.asarray(0.0 if theta is None else theta, dtype=np.float64)
-    if theta_arr.ndim > 1 or (theta_arr.ndim == 1 and theta_arr.size != D.shape[0]) \
-            or not np.isfinite(theta_arr).all() or (theta_arr < 0).any() or (theta_arr > 1).any():
-        raise ValueError("theta must be a number in [0, 1] or one such value per row of D")
-    theta_r = np.broadcast_to(theta_arr, (D.shape[0],))
-    blocks = _block_records(D, sols, time_values)
-    return _report_from_blocks(D, blocks, D.shape[0], theta_r, row_labels)

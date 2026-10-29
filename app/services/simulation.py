@@ -83,38 +83,44 @@ class SimulationResult:
 class QueueSimulationSinglequeue:
     """
     Single FIFO queue served by a time-varying set of labelled servers.
-
+ 
     Assumptions:
     - intervals are already validated and non-overlapping;
     - every interval contains server_labels;
     - every server label exists in server_registry;
     - passengers already contain arrival_min and flight_departure_min.
+ 
+    drain_queue=True: when the last interval ends, its servers are not closed: they stay open until the queue is empty
+    (and serve the passengers arriving after the closure, if any), so every passenger is eventually served and nobody
+    is left "unserved". The queue time of the late passengers is part of the results. If the last interval has no
+    servers there is nobody to drain the queue and the flag has no effect.
+    drain_queue=False: closure is final, the passengers still waiting are the unserved ones.
     """
 
-    def __init__(self, all_pax, intervals, server_registry, start_dt, seed):
+    def __init__(self, all_pax, intervals, server_registry, start_dt, seed, drain_queue=True):
         self.all_pax = sorted(all_pax, key=lambda x: x.arrival_min)
         self.intervals = sorted(intervals, key=lambda interval: interval.start)
         self.server_registry = server_registry
         self.start_dt = start_dt
         self.seed = seed
-
+ 
         self.rng = np.random.default_rng(seed)
-
+ 
         self.server_registry_by_label = {
             str(server["label"]): server
             for server in server_registry.values()
         }
-
+ 
         self.last_interval_end_min = (
             self.intervals[-1].end - self.start_dt
         ).total_seconds() / 60
-
+ 
         # Used to determine which servers are scheduled at any simulation time.
         self._interval_starts = [
             interval.start
             for interval in self.intervals
         ]
-
+ 
         self._interval_label_sets = [
             frozenset(
                 str(label)
@@ -122,8 +128,10 @@ class QueueSimulationSinglequeue:
             )
             for interval in self.intervals
         ]
-
+ 
+        self.drain_queue = bool(drain_queue) and len(self._interval_label_sets[-1]) > 0
         self._capacity_schedule = self._build_capacity_schedule()
+    
     
     def run(self):
         state = SimulationState(start_dt=self.start_dt)
@@ -165,30 +173,33 @@ class QueueSimulationSinglequeue:
     def _build_capacity_schedule(self) -> list[tuple[dt.datetime, frozenset[str]]]:
         """
         Build the sequence of capacity changes.
-
+ 
         This also handles gaps between intervals: at the end of an interval,
         capacity becomes zero unless another interval starts at the same time.
+        With drain_queue the last interval never ends: its servers stay open to empty the queue.
         """
         changes = {}
-
-        for interval, labels in zip(
+        last = len(self.intervals) - 1
+ 
+        for i, (interval, labels) in enumerate(zip(
             self.intervals,
             self._interval_label_sets,
-        ):
+        )):
             changes[interval.start] = labels
-            changes[interval.end] = frozenset()
-
+            if not (self.drain_queue and i == last):
+                changes[interval.end] = frozenset()
+ 
         schedule = []
-
+ 
         for change_dt, target_labels in sorted(changes.items()):
             # Skip consecutive changes that do not alter the target set.
             if schedule and schedule[-1][1] == target_labels:
                 continue
-
+ 
             schedule.append(
                 (change_dt, target_labels)
             )
-
+ 
         return schedule
 
     def capacity_manager(self, env, servers, state):
@@ -264,43 +275,43 @@ class QueueSimulationSinglequeue:
         """
         Process a single passenger through the queue and service.
         """
-
+ 
         if env.now < pax.arrival_min:
             yield env.timeout(pax.arrival_min - env.now)
-
+ 
         state.record_queue(sim_minute=env.now, variation=1)
-
-        # Passenger arriving at or after final closure.
-        if env.now >= self.last_interval_end_min:
+ 
+        # Passenger arriving at or after final closure (with drain_queue the servers are still there).
+        if not self.drain_queue and env.now >= self.last_interval_end_min:
             state.pax_data.append(pax)
             return
-
+ 
         server_label = yield from self._acquire_server(
             env=env,
             servers=servers,
             state=state,
         )
-
+ 
         # No server obtained before final closure.
         # The passenger remains represented in the residual queue.
         if server_label is None:
             state.pax_data.append(pax)
             return
-
+ 
         processing_time = self._sample_processing_time(server_label=server_label)
-
+ 
         state.record_queue( sim_minute=env.now, variation=-1)
         state.record_server(sim_minute=env.now, variation=1,)
-
+ 
         service_start = env.now
-
+ 
         yield env.timeout(processing_time)
-
+ 
         service_end = env.now
-
+ 
         state.record_server(sim_minute=service_end, variation=-1)
         state.record_completed(pax_id=pax.id, sim_minute=service_end,)
-
+ 
         completed_pax = replace(
             pax,
             start_min=service_start,
@@ -308,71 +319,80 @@ class QueueSimulationSinglequeue:
             server_id=server_label,
             processing_time=processing_time,
         )
-
+ 
         state.pax_data.append(completed_pax)
-
+ 
         # The server may have been closed or changed during the service.
         if self._server_is_scheduled(server_label=server_label, sim_minute=service_end):
             state.active_server_labels.add(server_label)
             state.active_capacity = len(state.active_server_labels)
-
+ 
             yield servers.put(server_label)
-
+ 
         else:
             self._retire_server(server_label=server_label, state=state)
-
+ 
     def _acquire_server(self, env, servers, state):
         """
         Wait for an available server until final closure.
-
+ 
         A loop is used to handle the rare boundary case where a server token
         becomes available exactly when that server is no longer scheduled.
+ 
+        With drain_queue there is no closure: wait for a server for as long as it takes.
         """
+        if self.drain_queue:
+            while True:
+                server_label = str((yield servers.get()))
+                if self._server_is_scheduled(server_label=server_label, sim_minute=env.now):
+                    return server_label
+                self._retire_server(server_label=server_label, state=state)
+ 
         while env.now < self.last_interval_end_min:
             remaining_time = (self.last_interval_end_min - env.now)
-
+ 
             server_request = servers.get()
             closure_timeout = env.timeout(remaining_time)
-
+ 
             outcome = yield server_request | closure_timeout
-
+ 
             # Final closure has priority over starting a new service.
             if env.now >= self.last_interval_end_min:
                 if server_request in outcome:
                     acquired_label = str(outcome[server_request])
-
+ 
                     self._retire_server(server_label=acquired_label, state=state)
                 else:
                     server_request.cancel()
-
+ 
                 return None
-
+ 
             if server_request not in outcome:
                 server_request.cancel()
                 return None
-
+ 
             server_label = str(outcome[server_request])
-
+ 
             # Protect against simultaneous capacity-change/service events.
             if self._server_is_scheduled(server_label=server_label, sim_minute=env.now):
                 return server_label
-
+ 
             # Stale token belonging to a server just closed.
             self._retire_server(server_label=server_label, state=state)
-
+ 
         return None
-
+ 
     def _server_is_scheduled(self, server_label: str, sim_minute: float) -> bool:
         """
         Return whether a server is scheduled at a given simulation minute.
-
+ 
         Intervals are interpreted as [start, end).
         """
         current_dt = (
             self.start_dt
             + dt.timedelta(minutes=float(sim_minute))
         )
-
+ 
         interval_index = (
             bisect_right(
                 self._interval_starts,
@@ -380,15 +400,15 @@ class QueueSimulationSinglequeue:
             )
             - 1
         )
-
+ 
         if interval_index < 0:
             return False
-
+ 
         interval = self.intervals[interval_index]
-
-        if current_dt >= interval.end:
+ 
+        if current_dt >= interval.end and not (self.drain_queue and interval_index == len(self.intervals) - 1):
             return False
-
+ 
         return (
             str(server_label)
             in self._interval_label_sets[interval_index]

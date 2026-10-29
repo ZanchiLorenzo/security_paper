@@ -8,8 +8,11 @@ from matplotlib.ticker import MaxNLocator
 from matplotlib.patches import Rectangle, Patch
 from scipy.stats import gaussian_kde
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.collections import LineCollection
 from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 import app.services.simulation_batch as sb
+from app.services.coverage_dp import effective_grid
 import json
 
 GREY, ORANGE, RED, WHITE = "#9e9e9e", "#00b70f", "#ff0000", "#ffffff"
@@ -83,7 +86,7 @@ def shifts_label(blocks, bin_minutes):
 
 def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
                 metrics=None, demand_curve=None, processing_curve=None,
-                show_second=True, df_timeline=None, df_kpis=None, title_prefix="", queue_max=None):
+                show_second=True, df_timeline=None, df_kpis=None, title_prefix="", queue_max=None, D_ref=None):
     D = np.asarray(D, dtype=np.float64)
     labels = list(labels)
     time_values = pd.to_datetime(pd.Series(list(time_values))).reset_index(drop=True)
@@ -91,7 +94,11 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     if len(time_values) != T:
         raise ValueError(f"time_values has {len(time_values)} entries, D has {T} bins")
 
-    cov, _, coverage = coverage_from_arrays(D, blocks, labels, theta)
+    cov, _, _ = coverage_from_arrays(D, blocks, labels, theta)
+    # D = griglia su cui sono disegnate le barre; il totale è sempre la domanda reale
+    total = float((D_ref if D_ref is not None else D).sum())
+    coverage = float((D * cov).sum() / total) if total > 0 else float("nan")
+
     coverage_slot = None
     if demand_curve is not None and processing_curve is not None:
         dem_, proc_ = np.asarray(demand_curve, float), np.asarray(processing_curve, float)
@@ -126,6 +133,25 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
         ax.bar(x0, np.where(k, 1 - d, 0), width=width, bottom=c + np.where(k, d, 0), align="edge", color=RED, **edge)
         ax.bar(x0, np.where(~k, d, 0), width=width, bottom=c, align="edge", color=ORANGE, **edge)
         ax.bar(x0, np.where(~k, 1 - d, 0), width=width, bottom=c + np.where(~k, d, 0), align="edge", color=WHITE, **edge)
+
+    if D_ref is not None:                                   # layer originali, non ereditati
+        D_ref = np.asarray(D_ref, dtype=np.float64)
+        segs = []
+        for c in range(n_rows):
+            v = np.where(D_ref[c] > 1e-9, D_ref[c], 0.0)    # 0 = il layer non ha domanda
+            above = D_ref[c + 1] > 1e-9 if c + 1 < n_rows else np.zeros(T, dtype=bool)
+            for k in range(T):                              # tratti orizzontali
+                if v[k] <= 0:
+                    continue
+                if v[k] >= 1 - 1e-9 and above[k]:           # sul bordo con la riga sopra, che ha domanda: omesso
+                    continue
+                segs.append([(x_edges[k], c + v[k]), (x_edges[k + 1], c + v[k])])
+            vv = np.concatenate([[0.0], v, [0.0]])
+            for k in range(T + 1):                          # tratti verticali tra bin adiacenti e agli estremi
+                if vv[k] != vv[k + 1]:
+                    segs.append([(x_edges[k], c + vv[k]), (x_edges[k], c + vv[k + 1])])
+        ax.add_collection(LineCollection(segs, colors="black", linewidths=0.8, zorder=4))
+
     for c, s, ln in flat:
         ax.add_patch(Rectangle((x_edges[s], c), x_edges[s + ln] - x_edges[s], 1,
                                fill=False, edgecolor="black", linewidth=1.6))
@@ -134,8 +160,11 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
                     ha="center", va="center", fontsize=8)
     ax.set_ylim(0, n_rows); ax.set_yticks(np.arange(n_rows) + 0.5)
     ax.set_yticklabels([f"server {labels[c]}" if c < len(labels) else "no server" for c in range(n_rows)])
-    ax.legend(handles=[Patch(color=GREY, label="demand covered"), Patch(color=RED, label="idle capacity"),
-                       Patch(color=ORANGE, label="demand uncovered")], loc="upper right", fontsize=8)
+    handles = [Patch(color=GREY, label="demand covered"), Patch(color=RED, label="idle capacity"),
+               Patch(color=ORANGE, label="demand uncovered")]
+    if D_ref is not None:
+        handles.append(Line2D([0], [0], color="black", lw=0.8, label="original layer demand"))
+    ax.legend(handles=handles, loc="upper right", fontsize=6.5, handlelength=1.2, borderpad=0.4, labelspacing=0.3)
 
     if ax2 is not None:
         dem = np.asarray(demand_curve)
@@ -148,7 +177,7 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
         ax2.stairs(dem, x_edges, label="demand", color="royalblue", linewidth=1.5)
         ax2.stairs(proc, x_edges, label="processing", color="tab:green", linewidth=1.5)
         ax2.set_ylabel(f"pax / {bin_minutes:g} min")
-        ax2.legend(fontsize=8)
+        ax2.legend(loc="upper right", fontsize=6.5, handlelength=1.2, borderpad=0.4, labelspacing=0.3)
 
     if ax3 is not None:
         tl = df_timeline.sort_values("time_bin")
@@ -186,7 +215,7 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
         ax3b.set_ylabel("processing rate", color="tab:green")
         ax3b.tick_params(axis="y", colors="tab:green")
         ax3b.set_ylim(bottom=0)
-        ax3.legend(handles=handles, fontsize=8, loc="upper left")
+        ax3b.legend(handles=handles, fontsize=6.5, loc="upper right", handlelength=1.2, borderpad=0.4, labelspacing=0.3)
 
     axes = list(axs)
     for a in axes:
@@ -213,32 +242,36 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     plt.show()
 
 def plot_allocation(res, show_second=True, df_timeline=None, df_kpis=None, queue_max=None):
-    """Backward-compatible wrapper: only extracts the minimal inputs from `res`."""
     tv = pd.to_datetime(res.df_curves["time"]).reset_index(drop=True)
-    D = np.asarray(res.demand_grid, dtype=np.float64)
-    tv = tv.iloc[:D.shape[1]]
+    D_plain = np.asarray(res.demand_grid, dtype=np.float64)
+    D_eff = np.asarray(getattr(res, "demand_grid_eff", res.demand_grid), dtype=np.float64)
+    T = D_eff.shape[1]
+    tv = tv.iloc[:T]
     blocks = schedule_to_slot_blocks(res.server_schedule, tv)
-    plot_blocks(D, blocks, res.server_labels, tv,
-                       (res.theta_rows if getattr(res, 'theta_rows', None) is not None else res.theta), res.bin_minutes,
-                       demand_curve=res.df_curves["demand"].to_numpy()[:D.shape[1]],
-                       processing_curve=res.df_curves["processing"].to_numpy()[:D.shape[1]],
-                       df_timeline=df_timeline, df_kpis=df_kpis,
-                       show_second=show_second, queue_max=queue_max)
+    D_ref = None if np.allclose(D_eff, D_plain) else D_plain      # linea sottile solo se c'è differenza
+    plot_blocks(D_eff, blocks, res.server_labels, tv, res.theta_rows, res.bin_minutes,
+                demand_curve=res.df_curves["demand"].to_numpy()[:T],
+                processing_curve=res.df_curves["processing"].to_numpy()[:T],
+                df_timeline=df_timeline, df_kpis=df_kpis, show_second=show_second,
+                queue_max=queue_max, D_ref=D_ref)
 
 def plot_run_from_row(row, D, labels, time_values, bin_minutes, queue_max, demand_curve=None,
-                      rate_by_label=None, show_second=True, check=False, show_queue=True):
+                      rate_by_label=None, show_second=True, check=False, show_queue=True,
+                      D_eff=None, inherit=True):
     """
-    Plot a df_pert row: blocks, theta, coverage, coverage_slot, qtime_mean and n_unserved all come from the row.
-    D, labels, time_values, demand_curve: from the (single) demand the experiment was run on.
-    rate_by_label (planner.rate_by_label): needed only to draw the processing curve.
-    df_timeline: optional sim_results.df_timeline, for the queue panel (not stored in df_pert).
-    check: warns if the demand grid in hand is not the one the row was generated with.
+    D     : griglia reale (layer semplici).
+    D_eff : griglia con i riporti; se None e inherit=True viene ricostruita dai blocchi della riga
+            (effective_grid); inherit=False: righe indipendenti.
     """
     blocks = parse_blocks(row["blocks"])
     D = np.asarray(D, dtype=np.float64)
+    cov = coverage_mask(blocks, labels, D.shape)
+    if D_eff is None:
+        D_eff = effective_grid(D, list(cov)) if inherit else D
+    D_eff = np.asarray(D_eff, dtype=np.float64)
+
     if check:
-        cov = coverage_mask(blocks, labels, D.shape)
-        covered = float(D[cov].sum())
+        covered = float(D_eff[cov].sum())
         if not (np.isclose(covered / float(D.sum()), row["coverage"], atol=1e-9)
                 and np.isclose(covered, row["covered_demand"], atol=1e-6)):
             print("WARNING: demand grid differs from the one used for this run.")
@@ -258,9 +291,10 @@ def plot_run_from_row(row, D, labels, time_values, bin_minutes, queue_max, deman
     if show_queue and isinstance(tl, str):
         df_timeline = sb.timeline_to_df(tl)
 
-    plot_blocks(D, blocks, labels, time_values, theta, bin_minutes, metrics=metrics,
+    D_ref = None if np.allclose(D_eff, D) else D
+    plot_blocks(D_eff, blocks, labels, time_values, theta, bin_minutes, metrics=metrics,
                 demand_curve=demand_curve, processing_curve=proc, show_second=show_second,
-                df_timeline=df_timeline, title_prefix=f"rep {row['rep']}", queue_max=queue_max)
+                df_timeline=df_timeline, title_prefix=f"rep {row['rep']}", queue_max=queue_max, D_ref=D_ref)
 
 def save_context(planner, path):
     """

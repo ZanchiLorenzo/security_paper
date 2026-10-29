@@ -21,6 +21,10 @@ Optional iterated local search: random kicks followed by a new descent, keep onl
 """
 import numpy as np
 import pandas as pd
+try:
+    from app.services.coverage_dp import effective_grid
+except ImportError:
+    from coverage_dp import effective_grid
  
 # fluid queue
 def capacity_per_slot(blocks, rates, T):
@@ -78,14 +82,24 @@ def fluid_diagnostics(arrivals, rates, blocks, bin_minutes, refine=15):
     return pd.DataFrame(dict(arrivals=a_slot, capacity=cap, queue_end=Q))
 
 # evaluation of a schedule
-def evaluate(blocks, arrivals, rates, D, labels, theta, bin_minutes):
-    """theta: number, or one value per row of D (same order as labels), e.g. res.theta_rows."""
+def evaluate(blocks, arrivals, rates, D, labels, theta, bin_minutes, inherit=True):
+    """
+    theta: number, or one value per row of D (same order as labels), e.g. res.theta_rows.
+    inherit=True: the blocks of row r are valued on the demand the lower rows leave uncovered (coverage_dp.effective_grid),
+    as in SecurityPlanner.run: then coverage is the true coverage of the layers and objective = covered - theta * capacity.
+    """
+    D = np.asarray(D, dtype=np.float64)
     row_of = {l: c for c, l in enumerate(labels)}
-    theta_rows = np.broadcast_to(np.asarray(theta, dtype=np.float64), (np.shape(D)[0],))
+    theta_rows = np.broadcast_to(np.asarray(theta, dtype=np.float64), (D.shape[0],))
+    cov = np.zeros(D.shape, dtype=bool)
+    for label, bl in blocks.items():
+        for s, l in bl:
+            cov[row_of[label], s:s + l] = True
+    De = effective_grid(D, list(cov)) if inherit else D
     covered = idle = objective = 0.0
     for label, bl in blocks.items():
         for s, l in bl:
-            seg = D[row_of[label], s:s + l]
+            seg = De[row_of[label], s:s + l]
             c = float(seg.sum())
             covered += c; idle += float((1.0 - seg).sum())
             objective += c - theta_rows[row_of[label]] * l
@@ -93,8 +107,8 @@ def evaluate(blocks, arrivals, rates, D, labels, theta, bin_minutes):
     cap = capacity_per_slot(blocks, rates, len(a))
     wait, unserved = _fluid_from_cap(a, cap, bin_minutes)
     return dict(q_fluid=wait, unserved_fluid=unserved, covered_demand=covered, idle_capacity=idle,
-                coverage=covered / float(D.sum()),                          # layer coverage (what the DP maximizes)
-                coverage_slot=float(np.minimum(a, cap).sum() / a.sum()),    # true coverage, pooled capacity
+                coverage=covered / float(D.sum()),                          # layer coverage (= true coverage with inherit)
+                coverage_slot=float(np.minimum(a, cap).sum() / a.sum()),    # true coverage, pooled capacity of real rates
                 objective=objective)
  
 # neighbourhood
