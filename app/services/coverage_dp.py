@@ -1,7 +1,7 @@
 """
 Coverage DP and budget allocation for the lane opening windows.
  
-Pipeline (several window lengths: the one SecurityPlanner.run_multi uses). 
+Pipeline (several window lengths: the one SecurityPlanner.run uses). 
 D is the demand grid (rows, T), row r = r-th lane, values in [0, 1]:
  
     solve_coverage_batch_multi   value curve V_r(k) of every row (DP, all rows at once)
@@ -92,6 +92,13 @@ def _theta_rows(theta, n_rows: int) -> np.ndarray:
     if th.ndim > 1 or (th.ndim == 1 and th.size != n_rows) or not np.isfinite(th).all() or (th < 0).any() or (th > 1).any():
         raise ValueError("theta must be a number in [0, 1] or one such value per row")
     return np.broadcast_to(th, (n_rows,))
+
+def _check_bounds(bounds, T: int) -> tuple:
+    """(start_slot, end_slot) -> validated ints, 0 <= start < end <= T."""
+    s0, e0 = int(bounds[0]), int(bounds[1])
+    if not 0 <= s0 < e0 <= T:
+        raise ValueError(f"bounds {bounds} must satisfy 0 <= start < end <= T={T}")
+    return s0, e0
  
 def _prepare(D: np.ndarray, lengths: Sequence[int]):
     """
@@ -147,7 +154,8 @@ def solve_coverage_multi(
     demand: Sequence[float] | np.ndarray,
     lengths: Sequence[int],
     theta: float,
-    max_rects: Optional[dict] = None
+    max_rects: Optional[dict] = None,
+    bounds: Optional[tuple] = None
 ) -> MultiSolution:
     """
     Exact DP on one row: place disjoint windows of the given lengths, maximizing the sum of their values.
@@ -159,10 +167,19 @@ def solve_coverage_multi(
  
     Ties go to not placing a window, so a window of value <= 0 is never used.
     max_rects : {length: cap} on the windows of each length (default: as many as fit); used by solve_allocated_multi.
+    bounds : (start_slot, end_slot): every window must lie inside [start_slot, end_slot). The DP runs on that slice of the
+             demand (the demand outside is not modified, it is simply not coverable by this row); starts, coverage and
+             stats refer to the full row.
     """
     d = np.asarray(demand, dtype=np.float64)
     if d.ndim != 1:
         raise ValueError("demand must be 1-D; use solve_coverage_batch_multi for many rows")
+    if bounds is not None:
+        s0, e0 = _check_bounds(bounds, d.size)
+        sub = solve_coverage_multi(d[s0:e0], lengths, theta, max_rects)
+        cov = np.zeros(d.size, dtype=bool)
+        cov[s0:e0] = sub.coverage
+        return MultiSolution(sub.value, sub.starts + s0, sub.lengths, cov)._fill_stats(d)
     _check_demand_range(d)
     D, lengths, T, n_starts, caps = _prepare(d[None, :], lengths)
  
@@ -221,16 +238,21 @@ def solve_coverage_multi(
 def solve_coverage_batch_multi(
     demand: np.ndarray,
     lengths: Sequence[int],
-    theta: Union[float, Sequence[float]]
+    theta: Union[float, Sequence[float]],
+    bounds: Optional[tuple] = None
 ) -> np.ndarray:
     """
     Value curves of many rows at once. demand (N, T); theta: a number or one value per row.
     Returns (N, K_1+1, .., K_m+1), lengths sorted ascending: entry [r, k_1, .., k_m] is the best value of row r using
     at most k_i windows of lengths[i], for every i at once. This is the input of allocate_milp.
+    bounds : (start_slot, end_slot): windows only inside [start_slot, end_slot); the DP runs on that slice of the demand.
     """
     D = np.asarray(demand, dtype=np.float64)
     if D.ndim != 2:
         raise ValueError("demand must be (N, T)")
+    if bounds is not None:
+        s0, e0 = _check_bounds(bounds, D.shape[1])
+        D = D[:, s0:e0]
     _check_demand_range(D)
     theta_rows = _theta_rows(theta, D.shape[0])
     D, lengths, T, n_starts, caps = _prepare(D, lengths)
@@ -377,12 +399,28 @@ def effective_grid(D: np.ndarray, coverages: Sequence) -> np.ndarray:
         if r < len(coverages):
             n_open += np.asarray(coverages[r], dtype=bool)[:T]
     return out
- 
+
+def fixed_window_solution(demand: np.ndarray, theta: float, start: int, length: int) -> MultiSolution:
+    """
+    A row with one window decided by the user, not by the DP: [start, start + length) on the 1-D demand
+    (the demand the row sees). Same object as solve_coverage_multi returns, so reports and schedules treat it alike.
+    """
+    d = np.asarray(demand, dtype=np.float64)
+    start, length = int(start), int(length)
+    if length < 1 or start < 0 or start + length > d.size:
+        raise ValueError(f"window [{start}, {start + length}) does not fit in T={d.size}")
+    coverage = np.zeros(d.size, dtype=bool)
+    coverage[start:start + length] = True
+    value = float(d[coverage].sum() - float(theta) * length)
+    return MultiSolution(value, np.array([start]), np.array([length]), coverage)._fill_stats(d)
+
 def solve_allocated_multi(
     demand: np.ndarray,
     theta: Union[float, Sequence[float]],
     alloc: MultiAllocation,
     inherit: bool = True,
+    fixed: Optional[dict] = None,
+    bounds: Optional[tuple] = None
 ) -> list:
     """
     Recover the windows of every row, each with its own number of windows per length (alloc.k). 
@@ -392,6 +430,11 @@ def solve_allocated_multi(
     inherit=True: rows are solved in order, row r on the demand rows 0..r-1 left uncovered (see effective_grid), so its
     windows can fill the slots where a lower row is closed. alloc.k comes from the plain layers. For the true coverage, row
     r is never worse than on its plain layer, which is still a feasible choice.
+ 
+    fixed : {row: MultiSolution} rows that are already decided (see fixed_window_solution). They are not solved (alloc.k of
+            those rows is ignored) but, like any other row, they count as open lanes for the rows above them.
+    bounds : (start_slot, end_slot): the windows of the free rows must lie inside [start_slot, end_slot) (e.g. the operating
+            hours of the first server). The demand is not modified. Fixed rows are taken as they are.
     """
     D = np.asarray(demand, dtype=np.float64)
     if D.ndim != 2:
@@ -400,14 +443,22 @@ def solve_allocated_multi(
         raise ValueError(f"alloc has {alloc.k.shape[0]} rows, demand has {D.shape[0]}")
     theta_rows = _theta_rows(theta, D.shape[0])
  
+    fixed = fixed or {}
+    for r, sol in fixed.items():
+        if not 0 <= r < D.shape[0] or len(sol.coverage) != D.shape[1]:
+            raise ValueError(f"fixed row {r} does not match the demand grid {D.shape}")
+ 
     rho = D.sum(axis=0)
     n_open = np.zeros(D.shape[1])
     sols = []
     for r in range(D.shape[0]):
-        row = _inherited_row(rho, n_open) if inherit else D[r]
-        sol = solve_coverage_multi(row, alloc.lengths, float(theta_rows[r]),
-                                   max_rects={l: int(alloc.k[r, j]) for j, l in enumerate(alloc.lengths)},
-                                )
+        if r in fixed:
+            sol = fixed[r]
+        else:
+            row = _inherited_row(rho, n_open) if inherit else D[r]
+            sol = solve_coverage_multi(row, alloc.lengths, float(theta_rows[r]),
+                                       max_rects={l: int(alloc.k[r, j]) for j, l in enumerate(alloc.lengths)},
+                                       bounds=bounds)
         sols.append(sol)
         n_open += sol.coverage[:D.shape[1]]
     return sols

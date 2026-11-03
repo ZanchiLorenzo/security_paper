@@ -381,7 +381,7 @@ class QueueSimulationSinglequeue:
             self._retire_server(server_label=server_label, state=state)
  
         return None
- 
+    
     def _server_is_scheduled(self, server_label: str, sim_minute: float) -> bool:
         """
         Return whether a server is scheduled at a given simulation minute.

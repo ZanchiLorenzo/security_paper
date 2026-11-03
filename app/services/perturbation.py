@@ -2,10 +2,7 @@ import dataclasses
 import json
 import numpy as np
 import pandas as pd
-try:
-    from app.services.coverage_dp import effective_grid
-except ImportError:
-    from coverage_dp import effective_grid
+from app.services.coverage_dp import effective_grid
 
 def schedule_to_blocks(planner, res) -> dict:
     """res.server_schedule {label: [(start_dt, end_dt), ...]} -> {label: [(start_slot, length_slots), ...]}."""
@@ -76,7 +73,6 @@ def _slotwise(demand, processing) -> float:
     d = np.asarray(demand, float); c = np.asarray(processing, float)
     return float(np.minimum(d, c).sum() / d.sum()) if d.sum() > 0 else float("nan")
 
-
 def coverage_slotwise(arrivals, rate_by_label, blocks: dict) -> float:
     """
     True coverage of a schedule: sum_t min(arrivals_t, capacity_t) / sum_t arrivals_t,
@@ -89,7 +85,6 @@ def coverage_slotwise(arrivals, rate_by_label, blocks: dict) -> float:
         for s, l in bl:
             cap[int(s):int(s) + int(l)] += rate_by_label[label]
     return _slotwise(a, cap)
-
 
 def res_with_blocks(planner, res, blocks: dict, inherit: bool = True):
     """
@@ -118,21 +113,25 @@ def res_with_blocks(planner, res, blocks: dict, inherit: bool = True):
     )
 
 # random movement of some block
-def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator, step: int = 1):
+def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator, step: int = 1, fixed=None, bounds=None):
     """
     Move n_moves randomly chosen blocks (any lane), each by exactly `step` slots (default 1), to the left or
     to the right with equal probability. Lengths and lane assignment never change.
-
+ 
     The result is always feasible: a block stays between its neighbours in the same lane (adjacent blocks
     are allowed; neighbours already moved count with their new position) and ends by slot T
     (no overhang, as in the allocator). A block that cannot move in any direction is skipped
     and another one is drawn.
-
+ 
+    fixed : labels of the lanes that must not be touched (e.g. the fixed first server): their blocks never move.
+    bounds : (start_slot, end_slot): moved blocks must stay inside [start_slot, end_slot) (operating hours of the first server).
+ 
     Returns (new_blocks, moves): moves = [(label, block index, shift), ...] actually applied;
     len(moves) < n_moves only if too few blocks could move.
     """
     new = {k: list(v) for k, v in blocks.items()}
-    candidates = [(label, i) for label, bl in new.items() for i in range(len(bl))]
+    fixed = {str(f) for f in (fixed or ())}
+    candidates = [(label, i) for label, bl in new.items() if str(label) not in fixed for i in range(len(bl))]
     rng.shuffle(candidates)
     moves = []
     for label, i in candidates:
@@ -142,6 +141,8 @@ def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator,
         s, l = bl[i]
         lo = bl[i - 1][0] + bl[i - 1][1] if i > 0 else 0
         hi = (bl[i + 1][0] if i < len(bl) - 1 else T) - l          # the block must end by T (no overhang)
+        if bounds is not None:
+            lo, hi = max(lo, int(bounds[0])), min(hi, int(bounds[1]) - l)
         shifts = [d for d in (-step, step) if lo <= s + d <= hi]
         if not shifts:
             continue
@@ -149,18 +150,99 @@ def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator,
         bl[i] = (s + d, l)
         moves.append((label, i, d))
     return new, moves
-
+ 
 # what changed between two schedules of df_pert
 _METRICS = ["coverage", "objective", "qtime_mean", "n_unserved"]
-
+ 
+_EDIT_KEYS = {"lane", "block", "shift", "length", "remove"}
+ 
+def edit_blocks(blocks: dict, labels, edits, T: int, add=None, fixed=None, bounds=None):
+    """
+    Apply hand-written edits to a baseline schedule {label: [(start_slot, length_slots), ...]}.
+ 
+    edits : list of dicts, one per block to change
+              lane   : lane label (e.g. "server 3") or int = 0-based position in `labels`
+              block  : 0-based index of the block in the lane, sorted by start, as in diff_schedules
+                       (indices always refer to the baseline: earlier edits do not renumber them)
+              shift  : slots to move the block (default 0), + = later
+              length : new length in slots (optional); applied after the shift, the start is kept
+              remove : True to delete the block
+            e.g. dict(lane=2, block=2, length=6, shift=+1)
+    add   : list of dicts dict(lane=..., start=..., length=...) with new blocks (start in slots, 0-based)
+    fixed : labels of lanes that cannot be edited (the first_server lane: pass {labels[0]} when first_server is used)
+    bounds : (start_slot, end_slot): blocks of the non-fixed lanes must lie inside it (operating hours of the first server)
+    T     : slots of the day: every block must lie in [0, T] (no overhang) and blocks of a lane cannot overlap.
+ 
+    Returns (new_blocks, log): the edited schedule and a list of strings describing what was applied.
+    Raises ValueError (with the offending lane/blocks) if an edit is invalid.
+    """
+    labels = list(labels)
+    fixed = set(fixed or ())
+ 
+    def lane_of(x):
+        if isinstance(x, str):
+            if x not in labels and x not in blocks:
+                raise ValueError(f"unknown lane {x!r}; lanes are {labels}")
+            return x
+        i = int(x)
+        if not 0 <= i < len(labels):
+            raise ValueError(f"lane index {i} out of range 0..{len(labels) - 1} ({labels})")
+        return labels[i]
+ 
+    cur = {k: [[int(s), int(l)] for s, l in v] for k, v in blocks.items()}
+    log, touched = [], set()
+    for e in edits or []:
+        bad = set(e) - _EDIT_KEYS
+        if bad:
+            raise ValueError(f"unknown keys {sorted(bad)} in edit {e}; allowed: {sorted(_EDIT_KEYS)}")
+        lab, i = lane_of(e["lane"]), int(e["block"])
+        if lab in fixed:
+            raise ValueError(f"lane {lab!r} is fixed (first_server) and cannot be edited")
+        n = len(cur.get(lab, []))
+        if not 0 <= i < n:
+            raise ValueError(f"lane {lab!r} has {n} blocks (0..{n - 1}); block={i}")
+        if (lab, i) in touched:
+            raise ValueError(f"block {i} of lane {lab!r} is edited twice")
+        touched.add((lab, i))
+        if e.get("remove"):
+            log.append(f"{lab} block {i}: removed {tuple(cur[lab][i])}")
+            cur[lab][i] = None
+            continue
+        s, l = cur[lab][i]
+        shift, new_len = int(e.get("shift", 0)), e.get("length")
+        s2, l2 = s + shift, (l if new_len is None else int(new_len))
+        cur[lab][i] = [s2, l2]
+        log.append(f"{lab} block {i}: ({s},{l}) -> ({s2},{l2})")
+    for a in add or []:
+        lab = lane_of(a["lane"])
+        if lab in fixed:
+            raise ValueError(f"lane {lab!r} is fixed (first_server): cannot add blocks")
+        cur.setdefault(lab, []).append([int(a["start"]), int(a["length"])])
+        log.append(f"{lab}: added ({int(a['start'])},{int(a['length'])})")
+ 
+    out = {}
+    for lab, bl in cur.items():
+        bl = sorted((tuple(b) for b in bl if b is not None))
+        for s, l in bl:
+            if l < 1 or s < 0 or s + l > T:
+                raise ValueError(f"lane {lab!r}: block (start={s}, length={l}) is outside the day [0, {T}]")
+            if bounds is not None and lab not in fixed and (s < bounds[0] or s + l > bounds[1]):
+                raise ValueError(f"lane {lab!r}: block (start={s}, length={l}) is outside the operating hours {tuple(bounds)}")
+        for (s1, l1), (s2, l2) in zip(bl, bl[1:]):
+            if s2 < s1 + l1:
+                raise ValueError(f"lane {lab!r}: blocks (start={s1}, length={l1}) and (start={s2}, length={l2}) overlap")
+        if bl:
+            out[lab] = bl
+    return out, log
+ 
 def _pick_row(df_pert: pd.DataFrame, x) -> pd.Series:
     """x = value of the 'rep' column, or directly a row (pd.Series) of df_pert."""
     return x if isinstance(x, pd.Series) else df_pert.loc[df_pert["rep"] == x].iloc[0]
-
+ 
 def diff_schedules(df_pert: pd.DataFrame, rep_a, rep_b, planner=None, verbose: bool = True) -> pd.DataFrame:
     """
     Compare the schedules of two rows of df_pert (a = reference, e.g. the baseline rep=0; b = the other one).
-
+ 
     Returns one row per block that differs:
       kind = 'moved'   same lane, same length, different start (shift = start_b - start_a, in slots)
              'removed' block only in a
@@ -173,7 +255,7 @@ def diff_schedules(df_pert: pd.DataFrame, rep_a, rep_b, planner=None, verbose: b
     ra, rb = _pick_row(df_pert, rep_a), _pick_row(df_pert, rep_b)
     A, B = parse_blocks(ra["blocks"]), parse_blocks(rb["blocks"])
     labels = list(A) + [k for k in B if k not in A]
-
+ 
     recs = []
     for label in labels:
         a, b = A.get(label, []), B.get(label, [])
@@ -190,7 +272,7 @@ def diff_schedules(df_pert: pd.DataFrame, rep_a, rep_b, planner=None, verbose: b
                 recs.append(dict(lane=label, block=b.index((s, l)), kind="added", length=l,
                                  start_a=None, start_b=s, shift=None))
     diff = pd.DataFrame(recs, columns=["lane", "block", "kind", "length", "start_a", "start_b", "shift"])
-
+ 
     if planner is not None and len(diff):
         t0, step = pd.Timestamp(planner.time_values[0]), planner.bin_duration
         hhmm = lambda s: None if pd.isna(s) else (t0 + int(s) * step).strftime("%H:%M")
@@ -198,7 +280,7 @@ def diff_schedules(df_pert: pd.DataFrame, rep_a, rep_b, planner=None, verbose: b
             diff[f"time_{side}"] = [
                 None if pd.isna(s) else f"{hhmm(s)}-{hhmm(s + l)}"
                 for s, l in zip(diff[f"start_{side}"], diff["length"])]
-
+ 
     if verbose:
         print(f"rep {ra['rep']} (a)  vs  rep {rb['rep']} (b): "
               f"{(diff.kind == 'moved').sum()} moved, {(diff.kind == 'removed').sum()} removed, "
