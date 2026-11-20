@@ -99,13 +99,12 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     total = float((D_ref if D_ref is not None else D).sum())
     coverage = float((D * cov).sum() / total) if total > 0 else float("nan")
 
-    coverage_slot = None
+    coverage = None
     if demand_curve is not None and processing_curve is not None:
         dem_, proc_ = np.asarray(demand_curve, float), np.asarray(processing_curve, float)
-        coverage_slot = float(np.minimum(dem_, proc_).sum() / dem_.sum()) if dem_.sum() > 0 else float("nan")
+        coverage = float(np.minimum(dem_, proc_).sum() / dem_.sum()) if dem_.sum() > 0 else float("nan")
     if metrics is not None:                                   # stored values win (title consistent with the df)
         coverage = metrics.get("coverage", coverage)
-        coverage_slot = metrics.get("coverage_slot", coverage_slot)
 
     flat = [(labels.index(l), s, ln) for l, bl in blocks.items() for s, ln in bl]
     multi_length = len({ln for _, _, ln in flat}) > 1
@@ -224,7 +223,7 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
         a.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=range(0, 60, 15)))
         a.set_axisbelow(True) 
         a.grid(axis="x", which="major", alpha=0.4)
-    slot_txt = f"{coverage_slot:.1%}" if coverage_slot is not None else "n/a"
+    slot_txt = f"{coverage:.1%}" if coverage is not None else "n/a"
     sim = {}
     if df_kpis is not None and len(df_kpis) > 0:
         sim = df_kpis.iloc[0].to_dict()
@@ -234,7 +233,7 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     if "qtime_mean" in sim and "n_unserved" in sim:
         sim_txt = f" | qtime = {sim['qtime_mean']:.2f} min | unserved = {sim['n_unserved']:.1f}"
     title = (f"L: {shifts_label(blocks, bin_minutes)} | theta = {theta_label(theta)} | "
-             f"coverage = {coverage:.1%} | coverage slot = {slot_txt}{sim_txt}")
+             f"coverage = {slot_txt}{sim_txt}")
 
     fig.suptitle(f"{title_prefix} {title}" if title_prefix else title, fontsize=10)
     fig.autofmt_xdate(rotation=90)
@@ -249,7 +248,7 @@ def plot_allocation(res, show_second=True, df_timeline=None, df_kpis=None, queue
     tv = tv.iloc[:T]
     blocks = schedule_to_slot_blocks(res.server_schedule, tv)
     D_ref = None if np.allclose(D_eff, D_plain) else D_plain      # linea sottile solo se c'è differenza
-    plot_blocks(D_eff, blocks, res.server_labels, tv, res.theta_rows, res.bin_minutes,
+    plot_blocks(D_eff, blocks, res.server_labels, tv, res.theta, res.bin_minutes,
                 demand_curve=res.df_curves["demand"].to_numpy()[:T],
                 processing_curve=res.df_curves["processing"].to_numpy()[:T],
                 df_timeline=df_timeline, df_kpis=df_kpis, show_second=show_second,
@@ -277,13 +276,10 @@ def plot_run_from_row(row, D, labels, time_values, bin_minutes, queue_max, deman
             print("WARNING: demand grid differs from the one used for this run.")
 
     theta = np.full(D.shape[0], float(row["theta"]))              # per-row theta, as in the experiment
-    tf = row.get("theta_first", None)
-    if tf is not None and pd.notna(tf):
-        theta[0] = float(tf)
 
     proc = (processing_from_blocks(blocks, rate_by_label, D.shape[1])
             if rate_by_label is not None else None)
-    keys = ["coverage", "coverage_slot", "qtime_mean", "n_unserved"]
+    keys = ["coverage", "qtime_mean", "n_unserved"]
     metrics = {k: row[k] for k in keys if k in row.index and pd.notna(row[k])}
 
     df_timeline = None

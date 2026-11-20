@@ -57,7 +57,6 @@ class PlannerResults:
     lengths: tuple                              # allowed shift lengths, hours
     lengths_cells: tuple                        # same, in bins
     theta: float                                # minimum utilization to open a window
-    theta_rows: tuple                           # theta used on each row (server_labels order)
     K_total: int                                # shared budget of shifts
     length_totals: Optional[dict]               # {hours: max shifts of that length}
     bin_minutes: float
@@ -67,8 +66,7 @@ class PlannerResults:
     server_labels: tuple                        # ordered by priority (first opened first)
     server_schedule: dict                       # label -> [(start, end), ...]
     df_curves: pd.DataFrame                     # per bin: time, demand, processing, servers
-    coverage: float                             # layer coverage: sum of the block coverages / total load (what the DP maximises)
-    coverage_slot: float                        # true coverage, see slotwise_coverage
+    coverage: float                             # demand / processing
     first_server_window: Optional[tuple] = None # (start_slot, length_slots) of the fixed first server, None if first_server=False
  
 class SecurityPlanner:
@@ -78,6 +76,8 @@ class SecurityPlanner:
     server_registry : {key: {"label", "priority", "dist", ...}}; processing times in minutes
     """
     def __init__(self, arrivals: pd.Series, server_registry: dict[str, dict]):
+
+        # check formats
         if not isinstance(arrivals, pd.Series) or not isinstance(arrivals.index, pd.DatetimeIndex):
             raise TypeError("arrivals must be a pd.Series indexed by a pd.DatetimeIndex")
         if (arrivals < 0).any():
@@ -85,8 +85,7 @@ class SecurityPlanner:
         if not server_registry:
             raise ValueError("server_registry cannot be empty.")
  
-
-        # extend to the end of the first day (midnight)
+        # extend arrivals to the end of the first day (midnight)
         step = self._regular_step(arrivals.index)
         day_end = arrivals.index[0].normalize() + pd.Timedelta(days=1)
         if day_end > arrivals.index[-1] + step:
@@ -103,19 +102,16 @@ class SecurityPlanner:
         self.server_labels = sort_labels_by_priority(server_registry)
         self.rate_by_label, _ = get_processing_rate_by_label(server_registry, self.bin_minutes)
 
-        # demand grid (R, T) for the coverage DP: layers of unit capacity, each layer is a row in the DP
+        # demand grid (R, T), R is the number of layers of unit capacity
         self.demand_grid = arrivals_to_demand_grid(self.arrivals.to_numpy(), mean_processing_rate(server_registry), self.bin_minutes)
-        self.demand_grid_eff = self.demand_grid  # will be updated if inherit=True
 
         self.results: Optional[PlannerResults] = None
-        self.report: Optional[CoverageReport] = None     # blocks / rows / total tables of the last run
  
     def run(self, 
             lengths: Sequence[float], 
             theta: float, 
             K_total: int,
             length_totals: Optional[dict] = None, 
-            theta_first: Optional[float] = None,
             inherit: bool = True,
             first_server: Union[bool, tuple, None] = None
             ) -> PlannerResults:
@@ -124,8 +120,6 @@ class SecurityPlanner:
         theta         : minimum utilization to open a window, in [0, 1]
         K_total       : total number of shifts (of any length) shared among the servers
         length_totals : {hours: max shifts of that length across all servers}
-        theta_first   : theta of the first row (first server in priority order) if different from theta;
-                        theta_first=0 keeps that server on for as long as the budget allows
         inherit       : each row is solved on the demand the lower rows left uncovered (see coverage_dp.effective_grid). False: rows independent (plain layers).
         first_server  : first_server: None/False = no fixed server; True = the first server is open for the whole demand grid; 
                         (start, end) = open only in that window (e.g. (“04:30”, “24:00”))
@@ -133,28 +127,22 @@ class SecurityPlanner:
                         open lane for the rows above it, and its blocks, coverage and objective appear in the report.
         """
 
+        # checks formats
         lengths_h = sorted({float(l) for l in lengths})
         if not lengths_h or lengths_h[0] <= 0:
             raise ValueError("lengths must be a non-empty list of positive durations (hours).")
         if not 0 <= theta <= 1:
             raise ValueError("theta must be in [0, 1].")
-        if theta_first is not None and not 0 <= theta_first <= 1:
-            raise ValueError("theta_first must be in [0, 1].")
         if int(K_total) != K_total or K_total < 0:
             raise ValueError("K_total must be an integer >= 0.")
         K_total = int(K_total)
 
-        if length_totals is not None:
-            total_length = sum(int(v) for _, v in length_totals.items())
-            if total_length > K_total:
-                raise ValueError(f"Total shifts by length ({total_length}) exceeds K_total ({K_total}).")
-
+        # convert lengths in hours to bins
         bin_hours = self.bin_minutes / 60.0
         cells_of = {h: max(1, math.floor(h / bin_hours + 0.5)) for h in lengths_h}
         lengths_cells = [cells_of[h] for h in lengths_h]
         if len(set(lengths_cells)) < len(lengths_cells):
-            raise ValueError(f"lengths {lengths_h} h collapse onto the same number of bins ({lengths_cells}) "
-                             f"with {self.bin_minutes:g}-minute bins.")
+            raise ValueError(f"lengths {lengths_h} h collapse onto the same number of bins ({lengths_cells}) with {self.bin_minutes:g}-minute bins.")
  
         totals_cells = None
         if length_totals is not None:
@@ -163,17 +151,15 @@ class SecurityPlanner:
                 raise ValueError(f"length_totals has lengths {sorted(unknown)} not in lengths={lengths_h}")
             totals_cells = {cells_of[float(h)]: int(v) for h, v in length_totals.items()}
  
-        # only as many counter rows as there are servers to staff them
+        # keep only as many counter rows as there are servers
         n_rows = self.demand_grid.shape[0]
         n_usable = min(n_rows, len(self.server_labels))
         if n_usable < n_rows:
             logger.warning(f"[SecurityPlanner] demand needs up to {n_rows} servers but the registry has {n_usable}")
+        
         grid = self.demand_grid[:n_usable]
         labels = self.server_labels[:n_usable]
- 
         theta_rows = np.full(n_usable, float(theta))
-        if theta_first is not None:
-            theta_rows[0] = float(theta_first)
 
         # first server fixed for the operating day: it is not allocated, the other rows are planned around it
         fixed, first_window = {}, None
@@ -182,49 +168,47 @@ class SecurityPlanner:
             fixed[0] = fixed_window_solution(grid[0], theta_rows[0], *first_window)
         n_fixed = len(fixed)
 
-        # bounds for the windows opening
+        # bounds for the windows opening, given from the first server
         bounds = (first_window[0], first_window[0] + first_window[1]) if first_server else None
 
-        # optimization: value curves -> how many windows per row -> where they are
-        logger.info(f"[SecurityPlanner] lengths={lengths_h} h, theta={theta:.2f}, first_server={first_server}")
+        logger.info(f"[SecurityPlanner] running")
 
-        T = grid.shape[1]
         if n_usable > n_fixed:
-            # demand the free rows see if every free lane below is open all day, the fixed ones only in their window
-            assumed = grid
-            if inherit and n_fixed:
-                assumed = effective_grid(grid, [fixed[0].coverage] + [np.ones(T, dtype=bool)] * (n_usable - n_fixed))
-            curves = solve_coverage_batch_multi(assumed[n_fixed:], lengths_cells, theta_rows[n_fixed:], bounds=bounds)
+            # solve the rows that are not fixed by the first server
+            curves = solve_coverage_batch_multi(grid[n_fixed:], lengths_cells, theta_rows[n_fixed:], bounds=bounds)
+            # allocate the budgets across the rows
             alloc_free = allocate_milp(curves, lengths_cells, K_total=K_total, length_per_day=totals_cells)
             alloc = MultiAllocation(
                 k=np.vstack([np.zeros((n_fixed, len(lengths_cells)), dtype=int), alloc_free.k]),
                 lengths=alloc_free.lengths, value=alloc_free.value,
                 per_row_value=np.concatenate([np.zeros(n_fixed), alloc_free.per_row_value]))
+            # solve the rows with their allocation (back-tracking DP)
             sols = solve_allocated_multi(grid, theta_rows, alloc, inherit=inherit, fixed=fixed, bounds=bounds)
         else:
             sols = [fixed[0]]
- 
-        # report on the whole grid: rows without a server have demand and no blocks
-        extra = n_rows - n_usable
+
+        # effective demand grid post-inheritance: what each row sees after the lower rows have covered their share of the demand
         D_eff = effective_grid(self.demand_grid, [s.coverage for s in sols]) if inherit else self.demand_grid
-        report = coverage_report_multi(
-            D=self.demand_grid, sols=sols, time_values=self.time_values, D_cov=D_eff,
-            theta=np.append(theta_rows, np.full(extra, float(theta))),
-            row_labels=list(labels) + ["no server"] * extra)
  
+        # get schedule of resources and curves for plotting
         schedule, df_curves = self._schedule_and_curves(sols, labels)
-        cov_slot = slotwise_coverage(df_curves["demand"], df_curves["processing"])
-        total = report.total.copy()
-        total["coverage_slot"] = cov_slot
-        self.report = CoverageReport(blocks=report.blocks, rows=report.rows, total=total)
- 
+
+        # compute the coverage of the schedule (demand / processing)
+        coverage = slotwise_coverage(df_curves["demand"], df_curves["processing"])
+   
         self.results = PlannerResults(
-            lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells),
-            theta=float(theta), theta_rows=tuple(float(t) for t in theta_rows),
-            K_total=K_total, length_totals=length_totals, bin_minutes=self.bin_minutes,
-            demand_grid=self.demand_grid, demand_grid_eff=D_eff, server_labels=tuple(labels),
-            server_schedule=schedule, df_curves=df_curves,
-            coverage=float(report.total["coverage"]), coverage_slot=cov_slot,
+            lengths=tuple(lengths_h), 
+            lengths_cells=tuple(lengths_cells),
+            theta=float(theta), 
+            K_total=K_total, 
+            length_totals=length_totals, 
+            bin_minutes=self.bin_minutes,
+            demand_grid=self.demand_grid, 
+            demand_grid_eff=D_eff, 
+            server_labels=tuple(labels),
+            server_schedule=schedule, 
+            df_curves=df_curves,
+            coverage=coverage,
             first_server_window=first_window,
         )
         return self.results
@@ -250,8 +234,7 @@ class SecurityPlanner:
         s = int(round((start - tv[0]) / self.bin_duration))
         e = int(round((end - tv[0]) / self.bin_duration))
         if s < 0 or e > T:
-            logger.warning(f"[SecurityPlanner] operating_hours {hours} go outside the demand grid "
-                           f"({tv[0]:%Y-%m-%d %H:%M} - {tv[-1] + self.bin_duration:%Y-%m-%d %H:%M}): clipped")
+            logger.warning(f"[SecurityPlanner] operating_hours {hours} go outside the demand grid: clipped")
         s, e = max(s, 0), min(e, T)
         if e - s < 1:
             raise ValueError(f"operating_hours {hours} do not overlap the demand grid")
@@ -612,7 +595,6 @@ class SecurityPlanner:
 
 
 
-
 # -- Simulator --
 @dataclasses.dataclass
 class SimulatorResults:
@@ -634,6 +616,11 @@ class SimulationTask:
     start_dt: dt.datetime                   # simulation start datetime, used to convert passenger arrival times to relative minutes 
 
 class SecuritySimulator:
+    """
+    flight_demand: list of Flight objects representing the flight demand for the simulation.
+    intervals: list of Interval objects representing the time intervals for the simulation.
+    server_registry: dictionary containing server processing parameters. 
+    """
     def __init__(
             self, 
             flight_demand: list[Flight],
@@ -641,15 +628,15 @@ class SecuritySimulator:
             server_registry: dict[str, dict]
         ):
 
-        if not isinstance(intervals, list) or not intervals:
-            raise ValueError("Intervals must be a non-empty list.")
-
+        # check formats
         if not isinstance(flight_demand, list) or not flight_demand:
             raise ValueError("Flight demand must be a non-empty list.")
-
         missing_sampler = [f.flight_key for f in flight_demand if f.arrival_sampler is None]
         if missing_sampler:
             raise ValueError(f"Flights missing arrival_sampler: {missing_sampler[:5]}")
+
+        if not isinstance(intervals, list) or not intervals:
+            raise ValueError("Intervals must be a non-empty list.")
 
         if not isinstance(server_registry, dict) or not server_registry:
             raise ValueError("Server registry must be a non-empty dictionary.")

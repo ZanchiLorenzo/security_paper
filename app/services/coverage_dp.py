@@ -479,7 +479,7 @@ def _block_records(D, sols, time_values, fixed_length=None) -> pd.DataFrame:
             recs.append(dict(row=c, block=b, length=l, start_slot=s0, start_time=tv.iloc[s0],
                              end_time=tv.iloc[s0] + l * step, covered_demand=covered, utilization=covered / l))
     return pd.DataFrame(recs, columns=_BLOCK_COLS)
- 
+
 def _report_from_blocks(D, blocks, theta_rows, row_labels) -> CoverageReport:
     """Per-row and total tables from the block table. D (n_rows, T) gives the demand of the rows."""
     n_rows = D.shape[0]
@@ -501,7 +501,7 @@ def _report_from_blocks(D, blocks, theta_rows, row_labels) -> CoverageReport:
         "n_blocks": int(n_blocks.sum()),
         "demand": float(row_demand.sum()),
         "covered_demand": float(covered.sum()),
-        "coverage": safe(float(covered.sum()), float(row_demand.sum())),
+        "coverage_sum": safe(float(covered.sum()), float(row_demand.sum())),
         "objective": float((covered - theta_rows * capacity).sum()),    # sum of (covered - theta * length)
     }
     for l, n in blocks.groupby("length").size().items():                 # how many windows of each length

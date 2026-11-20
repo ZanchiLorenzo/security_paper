@@ -57,7 +57,7 @@ def coverage_from_blocks(planner, res, blocks: dict, inherit: bool = True) -> di
     """
     D = planner.demand_grid
     labels = list(res.server_labels)
-    theta_rows = np.asarray(res.theta_rows, dtype=float)
+    theta_rows = np.broadcast_to(np.asarray(res.theta, dtype=float), (len(labels),))
     De = effective_grid_from_blocks(planner, res, blocks, inherit)
     covered = idle = objective = 0.0
     for r, label in enumerate(labels):
@@ -66,14 +66,14 @@ def coverage_from_blocks(planner, res, blocks: dict, inherit: bool = True) -> di
             covered += c
             idle += float(l) - c
             objective += c - theta_rows[r] * l
-    return dict(covered_demand=covered, idle_capacity=idle, coverage=covered / float(D.sum()), objective=objective)
+    return dict(covered_demand=covered, idle_capacity=idle, coverage_sum=covered / float(D.sum()), objective=objective)
 
 def _slotwise(demand, processing) -> float:
     """True coverage: sum_t min(demand_t, processing_t) / sum_t demand_t."""
     d = np.asarray(demand, float); c = np.asarray(processing, float)
     return float(np.minimum(d, c).sum() / d.sum()) if d.sum() > 0 else float("nan")
 
-def coverage_slotwise(arrivals, rate_by_label, blocks: dict) -> float:
+def compute_coverage(arrivals, rate_by_label, blocks: dict) -> float:
     """
     True coverage of a schedule: sum_t min(arrivals_t, capacity_t) / sum_t arrivals_t,
     with capacity_t = sum of the rates (pax per bin) of the lanes open at t.
@@ -108,8 +108,7 @@ def res_with_blocks(planner, res, blocks: dict, inherit: bool = True):
         server_schedule=blocks_to_schedule(planner, blocks),
         df_curves=df,
         demand_grid_eff=effective_grid_from_blocks(planner, res, blocks, inherit),
-        coverage=coverage_from_blocks(planner, res, blocks, inherit)["coverage"],
-        coverage_slot=_slotwise(df["demand"], df["processing"]),
+        coverage=_slotwise(df["demand"], df["processing"]),
     )
 
 # random movement of some block

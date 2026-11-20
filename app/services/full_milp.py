@@ -1,30 +1,4 @@
-"""
-Full MILP on the fluid queue: decides, for every lane, how many windows of each length and where they start,
-minimising the fluid queue directly. It replaces the whole chain  solve_coverage_batch_multi -> allocate_milp ->
-solve_allocated_multi  (demand grid, DP, allocation), and is meant as the queue-optimal benchmark of the
-coverage-optimal schedule.
-
-Same conventions as coverage_dp.py:
-    * lengths are in bins (cells), sorted;  no overhang: a window ends within the day;
-    * budgets: K_total, length_per_day {length: cap per day}, K_day (int / dict / sequence) as in allocate_milp;
-    * the output is the list of MultiSolution of solve_allocated_multi (one per row, day-major: row = n * R + r), so
-      coverage_report_multi, SecurityPlanner._schedule_and_curves, schedule_to_blocks ... work unchanged.
-
-Model (per day n, slots t = 0..T-1, dt = bin length in minutes, a_t = arrivals, mu_r = pax/bin of lane r)
-    x[r,l,s] in {0,1}      a window of length l opens on lane r in slot s   (0 <= s <= T-l)
-    sum_{l, s covering t} x[r,l,s] <= 1                                     windows of a lane do not overlap
-    c_t   = sum_r mu_r * sum_{l, s covering t} x[r,l,s]                      capacity of slot t (pax)
-    Q_t  >= Q_{t-1} + a_t - c_t,  Q_t >= 0,  Q_{-1} = 0                      fluid queue at the end of slot t
-Objective, LEXICOGRAPHIC and without any weight (two solves, same constraints):
-    stage 1   min  U = sum_n Q_{n,T-1}                                       fewest unserved passengers
-    stage 2   min  dt * sum_t (Q_{t-1} + Q_t)/2   s.t.  U <= U* + unserved_tol   then the smallest total waiting time
-Since a_t and c_t are uniform inside a slot, Q_t = max(0, Q_{t-1} + a_t - c_t) is exact at slot boundaries (it is the same
-queue as local_search._fluid_from_cap); the area under Q is the trapezoid of the two end values (exact when the queue
-does not empty inside the slot, a slight over-estimate otherwise). Q_{T-1} is the mass that never departs: the "unserved".
-The stage-2 objective / N is the mean wait per passenger, unserved ones waiting until the end of the horizon (censored).
-When U* = 0 it is exactly the mean wait of local_search.fluid_metrics; when U* > 0 the two differ slightly (that one
-averages over the served mass only).
-"""
+# DA RISCRIVERE TUTTO!
 import dataclasses
 import logging
 import math
@@ -335,13 +309,13 @@ def run_fluid_milp(planner, lengths, K_total, length_totals=None, unserved_tol=1
     rep = coverage_report_multi(D=planner.demand_grid, sols=sols, time_values=planner.time_values,
                                 row_labels=row_labels, theta=zeros, D_cov=D_eff)
     schedule, df_curves = planner._schedule_and_curves(sols, labels)
-    cov_slot = float(np.minimum(df_curves["demand"], df_curves["processing"]).sum() / df_curves["demand"].sum())
-    total = rep.total.copy(); total["coverage_slot"] = cov_slot
+    coverage = float(np.minimum(df_curves["demand"], df_curves["processing"]).sum() / df_curves["demand"].sum())
+    total = rep.total.copy(); total["coverage"] = coverage
     planner.report = type(rep)(blocks=rep.blocks, rows=rep.rows, total=total)
     planner.results = PlannerResults(
         lengths=tuple(lengths_h), lengths_cells=tuple(lengths_cells), theta=0.0, theta_rows=tuple(0.0 for _ in labels),
         K_total=int(K_total), length_totals=length_totals, bin_minutes=planner.bin_minutes,
         demand_grid=planner.demand_grid, demand_grid_eff=D_eff, server_labels=tuple(labels),
         server_schedule=schedule, df_curves=df_curves,
-        coverage=float(rep.total["coverage"]), coverage_slot=cov_slot)
+        coverage=float(rep.total["coverage"]), coverage=coverage)
     return planner.results, info
