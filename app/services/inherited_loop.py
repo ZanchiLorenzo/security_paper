@@ -1,32 +1,9 @@
-"""
-Loop DP + MILP + backtracking on the inherited demand.
-
-Pipeline now: the value curves (DP) and the allocation (MILP) use the plain layers d_{r,t}; only the recovery (backtracking)
-uses the inherited demand d^eff_{r,t} = clip(rho_t - o_{r,t}, 0, 1), o_{r,t} = number of lower rows open in slot t.
-Loop: the inherited demand of iteration k is built with the coverages of iteration k-1 and fed to the FIRST steps too:
-
-    iteration 0 :  curves(d)        -> MILP -> recovery on d^eff(coverages of the same solution, row by row)   (= current pipeline)
-    iteration k :  curves(d^eff_k)  -> MILP -> recovery,   d^eff_k = effective_grid(d, coverages_{k-1})
-
-The recovery always inherits row by row inside the iteration, so the final solution of every iteration is a valid schedule
-and its objective is the true one: sum_r (covered demand of row r on the final inherited grid - theta_r * capacity_r).
-
-Fixed point: the schedule (hence d^eff) repeats. If it does not converge, the schedule repeats after a cycle: stop says which.
-Everything is in bins (lengths and length_totals in cells), like coverage_dp.
-"""
-from re import match
-
 import numpy as np
 import pandas as pd
 
-try:
-    from app.services.coverage_dp import (
-        MultiAllocation, solve_coverage_batch_multi, allocate_milp, solve_allocated_multi, effective_grid,
-    )
-except ImportError:
-    from coverage_dp import (
-        MultiAllocation, solve_coverage_batch_multi, allocate_milp, solve_allocated_multi, effective_grid,
-    )
+from app.services.coverage_dp import (
+    MultiAllocation, solve_coverage_batch_multi, allocate_milp, solve_allocated_multi, effective_grid,
+)
 
 
 def _plan(grid, D_plan, lengths, theta_rows, K_total, length_totals, fixed, bounds):
@@ -45,7 +22,7 @@ def _plan(grid, D_plan, lengths, theta_rows, K_total, length_totals, fixed, boun
         k=np.vstack([np.zeros((n_fixed, len(lengths)), dtype=int), alloc_free.k]),
         lengths=alloc_free.lengths, value=alloc_free.value,
         per_row_value=np.concatenate([np.zeros(n_fixed), alloc_free.per_row_value]))
-    sols = solve_allocated_multi(grid, theta_rows, alloc, inherit=True, fixed=fixed, bounds=bounds)
+    sols = solve_allocated_multi(grid, theta_rows, alloc, inherit=False, fixed=fixed, bounds=bounds)
     return sols, alloc
 
 
@@ -131,7 +108,7 @@ def _first_server(grid, fixed_first):
 
 
 def loop_vs_theta_sweep(grid, lengths, thetas, K_total, length_totals, arrivals, rates, theta_grid=None,
-                        n_iter: int = 10, tol_q: float = 0.05, q_max: float = 60.0, fixed_first=None):
+                        n_iter=10, tol_q=0.5, q_max=60.0, fixed_first=None, tol_match=0.1):
     """
     One day (one grid). For every theta in `thetas`: plain pipeline (A), loop at its fixed point (B), and the plain
     pipeline on a fine grid of thetas (the "sweep", same K_total / length_totals). The loop is useful only if it gives
@@ -185,7 +162,7 @@ def loop_vs_theta_sweep(grid, lengths, thetas, K_total, length_totals, arrivals,
         sols, tr, hist = inherited_loop(grid, lengths, th, K_total, length_totals, n_iter=n_iter, fixed=fixed, verbose=False)
         B = summary(sols, th)
         same = [s["theta"] for s in sweep if s["sig"] == B["sig"]]
-        match = [s["cap"] for s in sweep if s["q"] <= B["q"] + tol_q] + ([A["cap"]] if A["q"] <= B["q"] + tol_q else [])
+        match = [s["cap"] for s in sweep if s["q"] <= B["q"] + tol_match] + ([A["cap"]] if A["q"] <= B["q"] + tol_match else [])
         cap_match = min(match) if match else np.inf
         cand = [s["q"] for s in sweep if s["cap"] <= B["cap"] + 1e-9] + ([A["q"]] if A["cap"] <= B["cap"] + 1e-9 else [])
         q_front = min(cand) if cand else np.inf
