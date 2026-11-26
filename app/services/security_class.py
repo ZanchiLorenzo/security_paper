@@ -112,7 +112,7 @@ class SecurityPlanner:
             theta: float, 
             K_total: int,
             length_totals: Optional[dict] = None, 
-            inherit: bool = True,
+            inherit: bool = False,
             first_server: Union[bool, tuple, None] = None
             ) -> PlannerResults:
         """

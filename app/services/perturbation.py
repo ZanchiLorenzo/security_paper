@@ -114,18 +114,19 @@ def res_with_blocks(planner, res, blocks: dict, inherit: bool = True):
 # random movement of some block
 def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator, step: int = 1, fixed=None, bounds=None):
     """
-    Move n_moves randomly chosen blocks (any lane), each by exactly `step` slots (default 1), to the left or
-    to the right with equal probability. Lengths and lane assignment never change.
- 
+    Move n_moves randomly chosen blocks (any lane), each by a random number of slots between 1 and `step`
+    (uniform), to the left or to the right with equal probability (when both directions are possible).
+    Lengths and lane assignment never change.
+
     The result is always feasible: a block stays between its neighbours in the same lane (adjacent blocks
     are allowed; neighbours already moved count with their new position) and ends by slot T
-    (no overhang, as in the allocator). A block that cannot move in any direction is skipped
-    and another one is drawn.
- 
+    (no overhang, as in the allocator). If the free room in a direction is smaller than `step`, the shift is
+    drawn up to that room. A block that cannot move in any direction is skipped and another one is drawn.
+
     fixed : labels of the lanes that must not be touched (e.g. the fixed first server): their blocks never move.
     bounds : (start_slot, end_slot): moved blocks must stay inside [start_slot, end_slot) (operating hours of the first server).
- 
-    Returns (new_blocks, moves): moves = [(label, block index, shift), ...] actually applied;
+
+    Returns (new_blocks, moves): moves = [(label, block index, shift), ...] actually applied (shift is signed);
     len(moves) < n_moves only if too few blocks could move.
     """
     new = {k: list(v) for k, v in blocks.items()}
@@ -142,10 +143,12 @@ def perturb_blocks(blocks: dict, T: int, n_moves: int, rng: np.random.Generator,
         hi = (bl[i + 1][0] if i < len(bl) - 1 else T) - l          # the block must end by T (no overhang)
         if bounds is not None:
             lo, hi = max(lo, int(bounds[0])), min(hi, int(bounds[1]) - l)
-        shifts = [d for d in (-step, step) if lo <= s + d <= hi]
-        if not shifts:
+        room = {-1: min(step, s - lo), +1: min(step, hi - s)}      # max shift available to the left / right
+        dirs = [d for d, r in room.items() if r >= 1]
+        if not dirs:
             continue
-        d = int(rng.choice(shifts))
+        sign = int(rng.choice(dirs))                                # left or right, equal probability
+        d = sign * int(rng.integers(1, room[sign] + 1))             # 1 .. room slots
         bl[i] = (s + d, l)
         moves.append((label, i, d))
     return new, moves

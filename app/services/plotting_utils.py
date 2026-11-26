@@ -119,9 +119,9 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     panels = ["blocks"] + (["curves"] if show_second else []) + (["queue"] if show_queue else [])
     ratios = {"blocks": 2, "curves": 2, "queue": 2}
     if len(panels) == 1:
-        fig, ax = plt.subplots(figsize=(10, 0.3 * n_rows + 2)); axs = [ax]
+        fig, ax = plt.subplots(figsize=(10, 0.25 * n_rows + 2)); axs = [ax]
     else:
-        fig, axs = plt.subplots(len(panels), 1, sharex=True, figsize=(10, 0.3 * n_rows + 1 * len(panels) + 1),
+        fig, axs = plt.subplots(len(panels), 1, sharex=True, figsize=(10, 0.25 * n_rows + 1 * len(panels) + 1),
                                 gridspec_kw={"height_ratios": [ratios[p] for p in panels]})
     axd = dict(zip(panels, axs))
     ax, ax2, ax3 = axd["blocks"], axd.get("curves"), axd.get("queue")
@@ -175,7 +175,7 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
            linewidth=0, label=f"demand within capacity ({pct:.1%})")
         ax2.stairs(dem, x_edges, label="demand", color="royalblue", linewidth=1.5)
         ax2.stairs(proc, x_edges, label="processing", color="tab:green", linewidth=1.5)
-        ax2.set_ylabel(f"pax / {bin_minutes:g} min")
+        ax2.set_ylabel("lanes (demand in\nserver-equivalents)")
         ax2.legend(loc="upper right", fontsize=6.5, handlelength=1.2, borderpad=0.4, labelspacing=0.3)
 
     if ax3 is not None:
@@ -184,16 +184,14 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
         pick = lambda base: f"{base}_median" if f"{base}_median" in tl else f"{base}_mean"
 
         # left axis: queue
-        if "queue_length_p5" in tl:
+        if "queue_length_p5" in tl and "queue_length_p95" in tl:
             ax3.fill_between(tb, tl["queue_length_p5"], tl["queue_length_p95"], step="post",
                              color="tab:red", alpha=0.12, linewidth=0)
-            ax3.fill_between(tb, tl["queue_length_p25"], tl["queue_length_p75"], step="post",
-                             color="tab:red", alpha=0.25, linewidth=0)
         q_col = pick("queue_length")
         l1, = ax3.step(tb, tl[q_col], where="post", color="tab:red", linewidth=1.5,
-                       label=q_col.replace("queue_length_", "queue "))
-        ax3.set_ylabel("queue (pax)", color="tab:red")
-        ax3.tick_params(axis="y", colors="tab:red")
+                       label="queue (median, p5&p95)")
+        ax3.set_ylabel("queue (pax)")
+        ax3.tick_params(axis="y")
         ax3.set_ylim(0, queue_max)
 
         # right axis: processing rate
@@ -201,18 +199,18 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
         handles = [l1]
         p_col = pick("processing_rate")
         if p_col in tl:
-            if "processing_rate_p25" in tl:
-                ax3b.fill_between(tb, tl["processing_rate_p25"], tl["processing_rate_p75"], step="post",
+            if "processing_rate_p5" in tl and "processing_rate_p95" in tl:
+                ax3b.fill_between(tb, tl["processing_rate_p5"], tl["processing_rate_p95"], step="post",
                                   color="tab:green", alpha=0.2, linewidth=0)
             l2, = ax3b.step(tb, tl[p_col], where="post", color="tab:green", linewidth=1.5,
-                            label=p_col.replace("_", " "))
+                            label="processing rate (median, p5&p95)")
             handles.append(l2)
         if "theoretical_processing_rate" in tl:
             l3, = ax3b.step(tb, tl["theoretical_processing_rate"], where="post", color="tab:green",
                             linewidth=1, linestyle="--", label="theoretical processing rate")
             handles.append(l3)
-        ax3b.set_ylabel("processing rate", color="tab:green")
-        ax3b.tick_params(axis="y", colors="tab:green")
+        ax3b.set_ylabel("processing rate (pax/bin)")
+        ax3b.tick_params(axis="y")
         ax3b.set_ylim(bottom=0)
         ax3b.legend(handles=handles, fontsize=6.5, loc="upper right", handlelength=1.2, borderpad=0.4, labelspacing=0.3)
 
@@ -230,8 +228,8 @@ def plot_blocks(D, blocks, labels, time_values, theta, bin_minutes,
     elif metrics is not None:
         sim = metrics
     sim_txt = ""
-    if "qtime_mean" in sim and "n_unserved" in sim:
-        sim_txt = f" | qtime = {sim['qtime_mean']:.2f} min | unserved = {sim['n_unserved']:.1f}"
+    if "qtime_mean" in sim:
+        sim_txt = f" | qtime = {sim['qtime_mean']:.2f} min"
     title = (f"L: {shifts_label(blocks, bin_minutes)} | theta = {theta_label(theta)} | "
              f"coverage = {slot_txt}{sim_txt}")
 
@@ -279,7 +277,7 @@ def plot_run_from_row(row, D, labels, time_values, bin_minutes, queue_max, deman
 
     proc = (processing_from_blocks(blocks, rate_by_label, D.shape[1])
             if rate_by_label is not None else None)
-    keys = ["coverage", "qtime_mean", "n_unserved"]
+    keys = ["coverage", "qtime_mean"]
     metrics = {k: row[k] for k in keys if k in row.index and pd.notna(row[k])}
 
     df_timeline = None
@@ -336,7 +334,6 @@ def plot_simulation(df, df_kpis=None, date=None):
             df_kpis = pd.DataFrame([{
                 'date': pd.to_datetime(date).normalize() if date is not None else pd.NaT,
                 'qtime_p50': np.nan,
-                'n_unserved': np.nan,
                 'qtime_above_15_pct': np.nan,
                 'qtime_above_30_pct': np.nan,
                 'qtime_above_60_pct': np.nan,
@@ -349,7 +346,6 @@ def plot_simulation(df, df_kpis=None, date=None):
             df_kpis = pd.DataFrame([{
                 'date': pd.to_datetime(date).normalize() if date is not None else pd.NaT,
                 'qtime_p50': np.nan,
-                'n_unserved': np.nan,
                 'qtime_above_15_pct': np.nan,
                 'qtime_above_30_pct': np.nan,
                 'qtime_above_60_pct': np.nan,
@@ -518,7 +514,7 @@ def plot_simulation(df, df_kpis=None, date=None):
 
 def add_kpi_cells(fig, df_kpis):
 
-    labels = ['qtime_p50', 'n_unserved', 'qtime_above_15_pct', 'qtime_above_30_pct', 'qtime_above_60_pct']
+    labels = ['qtime_p50', 'qtime_above_15_pct', 'qtime_above_30_pct', 'qtime_above_60_pct']
     values = [df_kpis[label].iloc[0] for label in labels]
     n = len(labels)
 
